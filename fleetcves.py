@@ -100,7 +100,7 @@ def sync_cpes():
     total = 0
     while True:
         window_end = min(start + timedelta(days=119), datetime.fromisoformat(end.replace('Z', '+00:00'))) if start else None
-        params = {'resultsPerPage': 2000}
+        params = {'resultsPerPage': 10000}
         if start:
             params.update(lastModStartDate=start.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
                           lastModEndDate=window_end.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
