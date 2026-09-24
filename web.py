@@ -125,16 +125,16 @@ async def run_sync():
     if _sync_task and not _sync_task.done():
         return
 
-    def progress(*args):
+    def progress(total, index, count):
         global sync_state
-        sync_state = f'Syncing NVD advisories ({args[0]:,} processed)…' if args and isinstance(args[0], int) else 'Syncing NVD advisories…'
+        sync_state = f'Syncing NVD advisories · {index:,}/{count:,} in current window · {total:,} processed this run'
 
     async def work():
         global sync_state
         sync_state = 'Syncing NVD advisories…'
         try:
             count = await asyncio.to_thread(store.sync_advisories, progress)
-            sync_state = f'Advisories synced ({count:,}); last sync {store.now()}'
+            sync_state = f'NVD sync complete · {count:,} records processed this run · last checked {store.now()}'
         except Exception as exc:
             sync_state = f'NVD sync failed: {exc}'
             log.exception('Advisory sync failed')
@@ -256,21 +256,21 @@ def index():
                     change(lambda: store.add_rule(kind.value, rvendor.value or '', rproduct.value or '',
                                                   (branch.value or '') if kind.value == 'baseline' else '',
                                                   (minimum.value or '') if kind.value == 'baseline' else '', reason.value or ''),
-                           lambda: (show_rules.refresh(), inbox_refresh(), archive_refresh()))
+                           refresh_rule_views)
                 ui.button('Add rule', on_click=add_rule)
 
             @ui.refreshable
             def show_rules():
                 for rule in store.rules_list():
                     with ui.row().classes('w-full items-center gap-3 border-b py-2'):
-                        ui.checkbox(value=bool(rule['enabled']), on_change=lambda e, rid=rule['id']: change(lambda: store.set_rule_enabled(rid, e.value), show_rules.refresh))
+                        ui.checkbox(value=bool(rule['enabled']), on_change=lambda e, rid=rule['id']: change(lambda: store.set_rule_enabled(rid, e.value), refresh_rule_views))
                         ui.label(f"{rule['kind']}: {rule['vendor']} / {rule['product']}" + (f" / {rule['branch']}" if rule['branch'] else '')).classes('flex-1')
                         if rule.get('minimum_version'):
                             ui.label(f"≥ {rule['minimum_version']}").classes('text-sm')
                         if rule.get('reason'):
                             ui.label(rule['reason']).classes('text-sm text-gray-600')
                         ui.label(f"{rule.get('archived_count', 0)} archived").classes('text-xs text-gray-500')
-                        ui.button('Delete', on_click=lambda _, rid=rule['id']: change(lambda: store.delete_rule(rid), show_rules.refresh)).props('flat color=negative')
+                        ui.button('Delete', on_click=lambda _, rid=rule['id']: change(lambda: store.delete_rule(rid), refresh_rule_views)).props('flat color=negative')
             show_rules()
 
         def advisory_panel(state_filter):
@@ -298,16 +298,17 @@ def index():
                     def save_rule():
                         selected = pairs[pair.value]
                         try:
-                            store.add_rule(rule_kind.value, selected['vendor'], selected['product'],
-                                           rule_branch.value or '' if rule_kind.value == 'baseline' else '',
-                                           rule_minimum.value or '' if rule_kind.value == 'baseline' else '', rule_reason.value or '')
+                            ident = store.add_rule(rule_kind.value, selected['vendor'], selected['product'],
+                                                   (rule_branch.value or '') if rule_kind.value == 'baseline' else '',
+                                                   (rule_minimum.value or '') if rule_kind.value == 'baseline' else '',
+                                                   rule_reason.value or '')
                         except ValueError as exc:
                             ui.notify(str(exc), type='negative')
                             return
                         dialog.close()
-                        show_items.refresh()
-                        show_rules.refresh()
-                        ui.notify('Product rule saved')
+                        refresh_rule_views()
+                        count = next(rule['archived_count'] for rule in store.rules_list() if rule['id'] == ident)
+                        ui.notify(f'Rule saved · {count} archived')
                     with ui.row():
                         ui.button('Create rule', on_click=save_rule)
                         ui.button('Cancel', on_click=dialog.close).props('flat')
@@ -382,6 +383,11 @@ def index():
                     archive_refresh = advisory_panel('auto_archived')
                 with ui.tab_panel(completed):
                     completed_refresh = advisory_panel('reviewed')
+    def refresh_rule_views():
+        show_rules.refresh()
+        inbox_refresh()
+        archive_refresh()
+        completed_refresh()
     tabs.on_value_change(lambda _: (inbox_refresh(), archive_refresh(), completed_refresh(), show_rules.refresh()))
     archived_tabs.on_value_change(lambda _: (archive_refresh(), completed_refresh()))
 

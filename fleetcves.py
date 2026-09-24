@@ -3,6 +3,7 @@ import argparse
 import csv
 import io
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -18,6 +19,7 @@ from rules import _cpe_parts, evaluate
 DB_PATH = Path(os.environ.get('FLEETCVES_DB', 'fleetcves.sqlite3'))
 NVD_BASE = os.environ.get('NVD_API_BASE', 'https://services.nvd.nist.gov/rest/json').rstrip('/')
 _last_request = 0.0
+log = logging.getLogger(__name__)
 _request_lock = threading.Lock()
 _sync_lock = threading.Lock()
 
@@ -137,14 +139,13 @@ def _decision(db, ident, raw, rules):
 
 
 def sync_advisories(on_progress=None):
-    """Download all CVEs initially; replay overlapping modification windows thereafter.
-
-    A window is never checkpointed until every page in the whole run succeeds.
-    """
+    """Import all CVEs, resuming the initial crawl and checkpointing completed update windows."""
     with _sync_lock:
         initialize()
         cursor = rows("SELECT value FROM metadata WHERE key='advisory_cursor'")
+        crawl = rows("SELECT value FROM metadata WHERE key='advisory_crawl_started'")
         end = datetime.now(timezone.utc)
+        crawl_started = crawl[0]['value'] if crawl else end.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
         start = datetime.fromisoformat(cursor[0]['value'].replace('Z', '+00:00')) - timedelta(seconds=1) if cursor else None
         total = 0
         while True:
@@ -153,7 +154,8 @@ def sync_advisories(on_progress=None):
             if start:
                 params.update(lastModStartDate=start.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
                               lastModEndDate=window_end.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
-            index = 0
+            index = int(rows("SELECT value FROM metadata WHERE key='advisory_page_index'")[0]['value']) if not start and crawl else 0
+            log.info('NVD %s: starting at offset %s', f'{start.isoformat()} through {window_end.isoformat()}' if start else 'initial crawl', index)
             while True:
                 data = request('cves/2.0', {**params, 'startIndex': index})
                 items = data['vulnerabilities']
@@ -185,18 +187,31 @@ def sync_advisories(on_progress=None):
                         db.execute('DELETE FROM advisory_products WHERE cve_id=?', (ident,))
                         db.executemany('INSERT OR IGNORE INTO advisory_products VALUES (?,?,?)', ((ident, v, p) for v, p in matches))
                         _decision(db, ident, raw, active)
+                    if not start:
+                        db.execute("INSERT INTO metadata VALUES ('advisory_crawl_started', ?) ON CONFLICT(key) DO NOTHING", (crawl_started,))
+                        db.execute("INSERT INTO metadata VALUES ('advisory_page_index', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(index + len(items)),))
                 total += len(items)
                 index += len(items)
+                log.info('NVD page %s/%s (%s processed this run)', index, count, total)
                 if on_progress:
                     on_progress(total, index, count)
                 if index >= count:
                     break
-            if not start or window_end >= end:
+            with database() as db:
+                checkpoint = crawl_started if not start else window_end.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+                db.execute("INSERT INTO metadata VALUES ('advisory_cursor', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (checkpoint,))
+                if not start:
+                    db.execute("DELETE FROM metadata WHERE key IN ('advisory_page_index', 'advisory_crawl_started')")
+            log.info('NVD checkpoint %s (%s processed this run)', checkpoint, total)
+            if not start:
+                start = datetime.fromisoformat(crawl_started.replace('Z', '+00:00')) - timedelta(seconds=1)
+                if crawl_started == end.isoformat(timespec='milliseconds').replace('+00:00', 'Z'):
+                    break
+            elif window_end >= end:
                 break
-            start = window_end - timedelta(seconds=1)
-        with database() as db:
-            db.execute("INSERT INTO metadata VALUES ('advisory_cursor', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       (end.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),))
+            else:
+                start = window_end - timedelta(seconds=1)
+        log.info('NVD sync complete (%s records processed this run)', total)
         return total
 
 
@@ -396,11 +411,18 @@ def main():
     if args.db:
         DB_PATH = Path(args.db)
     initialize()
+    if args.command in ('serve', 'sync'):
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+                            handlers=[logging.StreamHandler(), logging.FileHandler(str(DB_PATH) + '.log')])
     if args.command == 'serve':
         from web import run
         run()
     elif args.command == 'sync':
-        print(sync_advisories())
+        try:
+            print(sync_advisories())
+        except Exception:
+            log.exception('Advisory sync failed')
+            raise
     elif args.command == 'inbox':
         print(json.dumps(advisories(search=args.search, state=args.state), indent=2))
     elif args.command == 'coverage':

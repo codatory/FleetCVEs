@@ -51,6 +51,46 @@ class AdvisoryTest(unittest.TestCase):
         self.assertEqual(entry['changed_since_review'], 1)
         self.assertIn('changed', entry['products'])
 
+    def test_initial_import_resumes_after_failed_page(self):
+        first = {'vulnerabilities': [{'cve': advisory()}], 'totalResults': 2}
+        with patch.object(app, 'request', side_effect=[first, RuntimeError('second page failed')]):
+            with self.assertRaisesRegex(RuntimeError, 'second page failed'):
+                app.sync_advisories()
+        seen = []
+        def resumed(endpoint, params):
+            if 'lastModStartDate' in params:
+                return {'vulnerabilities': [], 'totalResults': 0}
+            seen.append(params['startIndex'])
+            return {'vulnerabilities': [{'cve': advisory('CVE-2026-5678')}], 'totalResults': 2}
+        with patch.object(app, 'request', side_effect=resumed):
+            self.assertEqual(app.sync_advisories(), 1)
+        self.assertEqual(seen, [1])
+        self.assertEqual(app.advisory_count(state='all'), 2)
+
+    def test_completed_update_window_is_not_replayed_after_failure(self):
+        original = (app.datetime.now(app.timezone.utc) - app.timedelta(days=250)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        with app.database() as db:
+            db.execute("INSERT INTO metadata VALUES ('advisory_cursor', ?)", (original,))
+        starts = []
+        def interrupted(endpoint, params):
+            starts.append(params['lastModStartDate'])
+            if len(starts) == 2:
+                raise RuntimeError('second window failed')
+            return {'vulnerabilities': [], 'totalResults': 0}
+        with patch.object(app, 'request', side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, 'second window failed'):
+                app.sync_advisories()
+        checkpoint = app.rows("SELECT value FROM metadata WHERE key='advisory_cursor'")[0]['value']
+        self.assertGreater(checkpoint, original)
+        resumed = []
+        def finish(endpoint, params):
+            resumed.append(params['lastModStartDate'])
+            return {'vulnerabilities': [], 'totalResults': 0}
+        with patch.object(app, 'request', side_effect=finish):
+            app.sync_advisories()
+        self.assertEqual(resumed[0], starts[1])
+        self.assertNotIn(starts[0], resumed)
+
     def test_failure_keeps_prior_successful_cursor_and_rows(self):
         self.sync(advisory())
         before = app.rows("SELECT value FROM metadata WHERE key='advisory_cursor'")[0]['value']
@@ -87,6 +127,20 @@ class AdvisoryTest(unittest.TestCase):
         app.set_rule_enabled(switch, True)
         app.delete_rule(router)
         self.assertEqual(app.advisory_count(), 1)
+
+    def test_new_exclusion_retroactively_archives_nested_existing_advisory(self):
+        cve = advisory()
+        cve['configurations'][0]['nodes'] = [{'operator': 'AND', 'children': [
+            {'operator': 'OR', 'cpeMatch': [match()]},
+            {'operator': 'OR', 'cpeMatch': [{'vulnerable': False, 'criteria': 'cpe:2.3:o:acme:platform:*:*:*:*:*:*:*:*'}]},
+        ]}]
+        self.sync(cve)
+        self.assertEqual(app.advisory_count(), 1)
+        ident = app.add_rule('exclude', 'acme', 'router', reason='Not deployed')
+        self.assertEqual(app.advisories(state='auto_archived')[0]['rule_ids'], json.dumps([ident]))
+        app.set_rule_enabled(ident, False)
+        self.assertEqual(app.advisory_count(), 1)
+
 
     def test_source_correction_reopens_automatic_archive(self):
         self.sync(advisory())

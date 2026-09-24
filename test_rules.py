@@ -37,6 +37,8 @@ class EvaluateTest(unittest.TestCase):
 
     def test_uncovered_or_alternative_stays_inbox(self):
         self.assertIsNone(evaluate(advisory(match(cpe()), match(cpe('other'))), [rule(1)]))
+        nested = advisory(match(cpe()), children=[{'operator': 'OR', 'cpeMatch': [match(cpe('other'))]}])
+        self.assertIsNone(evaluate(nested, [rule(1)]))
 
     def test_baseline_covers_only_numeric_versions_below_branch_floor(self):
         baseline = rule(3, 'baseline', branch='1.2', minimum_version='1.2.5')
@@ -60,11 +62,10 @@ class EvaluateTest(unittest.TestCase):
         self.assertIsNone(evaluate(advisory(match(cpe(version='*'), versionEndIncluding='18.0')), [baseline]))
         self.assertIsNone(evaluate(advisory(match(cpe(version='*'), versionStartIncluding='17.5.0', versionEndIncluding='17.6.4')), [baseline]))
 
-    def test_disabled_and_complex_or_unsupported_configurations_stay_inbox(self):
+    def test_disabled_negated_or_unsupported_configurations_stay_inbox(self):
         self.assertIsNone(evaluate(advisory(match(cpe())), [rule(1, enabled=False)]))
-        for cve in (advisory(match(cpe()), operator='AND'),
-                     advisory(match(cpe()), negate=True),
-                     advisory(match(cpe()), children=[]),
+        for cve in (advisory(match(cpe()), negate=True),
+                     advisory(match(cpe()), children=[{'operator': 'OR', 'negate': True, 'cpeMatch': [match(cpe())]}]),
                      {'configurations': [{'nodes': [{'operator': 'OR', 'cpeMatch': [
                          {'vulnerable': False, 'criteria': cpe()}]}]}]},
                      {'configurations': [{'nodes': [{'operator': 'OR', 'cpeMatch': [

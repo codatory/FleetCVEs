@@ -74,29 +74,38 @@ def _matches_product(parts, rule):
 
 
 def _vulnerable_matches(cve):
-    """Accept only flat OR configurations; anything more is unsafe to suppress."""
+    """Collect every affected product, including nested AND/OR context."""
     configurations = cve.get('configurations')
     if not isinstance(configurations, list) or not configurations:
         return None
     matches = []
+
+    def visit(node):
+        if (not isinstance(node, dict) or node.get('operator') not in ('AND', 'OR')
+                or node.get('negate', False) is not False):
+            return False
+        entries, children = node.get('cpeMatch', []), node.get('children', [])
+        if (not isinstance(entries, list) or not isinstance(children, list)
+                or not (entries or children)):
+            return False
+        for entry in entries:
+            if not isinstance(entry, dict) or type(entry.get('vulnerable')) is not bool:
+                return False
+            if entry['vulnerable'] is False:
+                continue
+            parts = _cpe_parts(entry.get('criteria'))
+            if parts is None or parts[2] not in ('a', 'o', 'h'):
+                return False
+            matches.append((entry, parts))
+        return all(visit(child) for child in children)
+
     for configuration in configurations:
         if not isinstance(configuration, dict) or not isinstance(configuration.get('nodes'), list) or not configuration['nodes']:
             return None
-        for node in configuration['nodes']:
-            if (not isinstance(node, dict) or node.get('operator') != 'OR' or node.get('negate', False) is not False
-                    or 'children' in node):
-                return None
-            entries = node.get('cpeMatch')
-            if not isinstance(entries, list) or not entries:
-                return None
-            for entry in entries:
-                if not isinstance(entry, dict) or entry.get('vulnerable') is not True:
-                    return None
-                parts = _cpe_parts(entry.get('criteria'))
-                if parts is None or parts[2] not in ('a', 'o', 'h'):
-                    return None
-                matches.append((entry, parts))
-    return matches or None
+        before = len(matches)
+        if not all(visit(node) for node in configuration['nodes']) or len(matches) == before:
+            return None
+    return matches
 
 
 def _affected_range(match, parts):

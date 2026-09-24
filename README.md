@@ -13,7 +13,7 @@ pip install -e .
 fleetcves serve
 ```
 
-Open <http://127.0.0.1:8080>. The first sync imports the NVD CVE collection and can take a long time without a key; later syncs use modification windows. Run `fleetcves sync` independently from cron/systemd or another scheduler. The local server runs periodic syncs. It binds **localhost only** and has **no authentication**: do not expose it on a network without adding access control.
+Open <http://127.0.0.1:8080>. The first sync imports the NVD CVE collection and can take a long time without a key; later syncs use modification windows. Sync progress and errors appear in the UI and in `<database path>.log` (by default `fleetcves.sqlite3.log`), as well as stderr. Run `fleetcves sync` independently from cron/systemd or another scheduler. The local server runs periodic syncs. It binds **localhost only** and has **no authentication**: do not expose it on a network without adding access control.
 
 ## Coverage and decisions
 
@@ -21,10 +21,10 @@ Add vendors in **Coverage** to focus the default **Monitored vendors** view in t
 
 Two rules are supported:
 
-- **Product exclusion:** a vendor/product pair known not to be deployed, with an explicit reason. Every potentially affected product in a simple advisory must be covered before it can be auto-archived.
-- **Minimum deployed version:** a vendor/product, numeric branch (e.g. `17.6`), and minimum version (e.g. `17.6.6`). Only a simple affected range provably ending *before* the minimum on the same branch can be archived (e.g. `>=17.6.0, <17.6.4`). An inclusive end equal to the minimum is not safe. An upper-only range such as `<17.6.4` may also include older branches, so it stays in the Inbox unless NVD supplies an explicit same-branch lower bound. Unclear branches, wildcard-only versions, nonnumeric versions, complex configurations, and missing data stay in the Inbox.
+- **Product exclusion:** a vendor/product pair known not to be deployed, with an explicit reason. Existing advisories are re-evaluated immediately, including nested AND/OR NVD configurations. Every potentially affected product must be covered before an advisory can be auto-archived.
+- **Minimum deployed version:** a vendor/product, numeric branch (e.g. `17.6`), and minimum version (e.g. `17.6.6`). Only an affected range provably ending *before* the minimum on the same branch can be archived (e.g. `>=17.6.0, <17.6.4`). An inclusive end equal to the minimum is not safe. An upper-only range such as `<17.6.4` may also include older branches, so it stays in the Inbox unless NVD supplies an explicit same-branch lower bound. Unclear branches, wildcard-only versions, nonnumeric versions, negated or malformed configurations, and missing data stay in the Inbox.
 
-Auto-archive is **not** a patch or manual disposition. Its rule IDs, explanation, and evaluation time are visible under **Archived**. From an advisory, use **Create product rule** to pick one of its affected NVD vendor/product pairs and choose an exclusion or minimum deployed version; the rule applies to that product across **all** advisories, not only the one you opened. Advisories with several affected products archive only when every product is safely covered. The Rules tab also permits manual entry. Adding, disabling, or deleting rules re-evaluates automatic decisions, as does changed NVD source data.
+Auto-archive is **not** a patch or manual disposition. Its rule IDs, explanation, and evaluation time are visible under **Archived**. From an advisory, use **Create product rule** to pick one of its affected NVD vendor/product pairs and choose an exclusion or minimum deployed version; the rule applies to that product across **all** existing and future advisories, not only the one you opened. Advisories with several affected products archive only when every product is safely covered. The Rules tab also permits manual entry. Adding, disabling, or deleting rules re-evaluates automatic decisions and updates all advisory views; changed NVD source data also re-evaluates its advisory.
 
 Use **N/A** for an advisory manually judged not applicable, **Verified** for confirmed affected work that should remain in the Inbox, and **Resolved** after remediation. N/A and Resolved appear under **Archived / Reviewed → Reviewed**; Verified stays in the Inbox. All three survive sync and rule changes. A changed NVD modification time flags a manually reviewed advisory; **Reopen** clears its manual disposition and reapplies current product rules. Notes persist throughout.
 
@@ -37,7 +37,7 @@ Use **N/A** for an advisory manually judged not applicable, **Verified** for con
 | `NVD_API_KEY` | Optional key for higher NVD request limits |
 | `NVD_API_BASE` | NVD REST base URL; default `https://services.nvd.nist.gov/rest/json` |
 
-Requests are serialized and spaced at least 6.1 seconds apart (0.65 with a key), within the NVD 5/30s or 50/30s limits. Sync pages at 2,000 items. Incremental queries use overlapping `lastModStartDate`/`lastModEndDate` windows smaller than the NVD 120-day maximum. A failed run keeps its previous successful cursor and saved advisories; replay is idempotent. No real-time guarantee or perfect vendor coverage is implied. See [NVD CVE API documentation](https://nvd.nist.gov/developers/vulnerabilities).
+Requests are serialized and spaced at least 6.1 seconds apart (0.65 with a key), within the NVD 5/30s or 50/30s limits. Sync requests 2,000 items per page and continues through `totalResults`; the UI's 50-row page size does not limit imports. The initial crawl resumes from its last saved page after interruption. Incremental queries use overlapping `lastModStartDate`/`lastModEndDate` windows smaller than the NVD 120-day maximum, checkpointing each completed window. A failed run keeps its saved advisories and resumes from the last checkpoint; replay is idempotent. No real-time guarantee or perfect vendor coverage is implied. See [NVD CVE API documentation](https://nvd.nist.gov/developers/vulnerabilities).
 
 ## CLI
 
