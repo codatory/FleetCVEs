@@ -44,6 +44,13 @@ def database():
         db.close()
 
 
+def _severity(cve):
+    metrics = cve.get('metrics', {})
+    return next((value for key in ('cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2')
+                 for entry in metrics.get(key, [])
+                 if (value := entry.get('cvssData', {}).get('baseSeverity') or entry.get('baseSeverity'))), None)
+
+
 def initialize():
     with database() as db:
         db.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
@@ -65,6 +72,12 @@ def initialize():
             product TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY(cve_id,vendor,product))''')
         db.execute('CREATE INDEX IF NOT EXISTS advisory_products_vendor ON advisory_products(vendor,product,cve_id)')
         db.execute('CREATE INDEX IF NOT EXISTS cves_published ON cves(published DESC,id DESC)')
+        if not db.execute("SELECT 1 FROM metadata WHERE key='cvss_v2_severity_v1'").fetchone():
+            for record in db.execute('SELECT id,raw FROM cves WHERE severity IS NULL AND raw IS NOT NULL'):
+                severity = _severity(json.loads(record['raw']))
+                if severity:
+                    db.execute('UPDATE cves SET severity=? WHERE id=?', (severity, record['id']))
+            db.execute("INSERT INTO metadata VALUES ('cvss_v2_severity_v1','1')")
         if not db.execute("SELECT 1 FROM metadata WHERE key='advisory_products_v1'").fetchone():
             for record in db.execute('SELECT id,raw FROM cves WHERE raw IS NOT NULL'):
                 db.executemany('INSERT OR IGNORE INTO advisory_products VALUES (?,?,?)',
@@ -168,10 +181,7 @@ def sync_advisories(on_progress=None):
                         cve = item['cve']
                         ident = cve['id']
                         raw = json.dumps(cve, separators=(',', ':'), sort_keys=True)
-                        metrics = cve.get('metrics', {})
-                        severity = next((v['cvssData']['baseSeverity'] for key in
-                            ('cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2')
-                            for v in metrics.get(key, []) if 'baseSeverity' in v.get('cvssData', {})), None)
+                        severity = _severity(cve)
                         description = next((d['value'] for d in cve.get('descriptions', []) if d.get('lang') == 'en'), '')
                         old = db.execute('SELECT raw FROM cves WHERE id=?', (ident,)).fetchone()
                         if old and old['raw'] == raw:

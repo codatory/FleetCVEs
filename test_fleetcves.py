@@ -37,6 +37,24 @@ class AdvisoryTest(unittest.TestCase):
         with patch.object(app, 'request', return_value={'vulnerabilities': [{'cve': c} for c in records], 'totalResults': len(records)}):
             return app.sync_advisories()
 
+    def test_cvss_v2_severity_is_available_to_filters(self):
+        older = advisory()
+        older['metrics'] = {'cvssMetricV2': [{'cvssData': {'baseScore': 7.5}, 'baseSeverity': 'HIGH'}]}
+        newer = advisory('CVE-2026-0002')
+        newer['metrics']['cvssMetricV2'] = [{'cvssData': {'baseScore': 4.0}, 'baseSeverity': 'MEDIUM'}]
+        self.sync(older, newer)
+        self.assertEqual(app.advisory_count(severity='HIGH', state='all'), 2)
+
+    def test_existing_cvss_v2_advisory_severity_is_backfilled(self):
+        cve = advisory()
+        cve['metrics'] = {'cvssMetricV2': [{'cvssData': {'baseScore': 7.5}, 'baseSeverity': 'HIGH'}]}
+        with app.database() as db:
+            db.execute("DELETE FROM metadata WHERE key='cvss_v2_severity_v1'")
+            db.execute('INSERT INTO cves(id,description,raw) VALUES (?,?,?)',
+                       (cve['id'], 'legacy', json.dumps(cve)))
+        app.initialize()
+        self.assertEqual(app.advisory_count(severity='HIGH', state='all'), 1)
+
     def test_ingestion_idempotent_and_manual_work_survives_refresh(self):
         cve = advisory()
         self.assertEqual(self.sync(cve), 1)
