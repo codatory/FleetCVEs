@@ -37,8 +37,8 @@ class Notes(BaseModel):
     notes: str
 
 
-class Complete(BaseModel):
-    complete: bool
+class Disposition(BaseModel):
+    disposition: str | None
 
 
 def apply(fn, *args):
@@ -68,9 +68,9 @@ def api_notes(cve_id: str, data: Notes):
     return {'ok': True}
 
 
-@app.put('/api/advisories/{cve_id}/complete')
-def api_complete(cve_id: str, data: Complete):
-    apply(store.set_complete, cve_id, data.complete)
+@app.put('/api/advisories/{cve_id}/disposition')
+def api_disposition(cve_id: str, data: Disposition):
+    apply(store.set_disposition, cve_id, data.disposition)
     return {'ok': True}
 
 
@@ -219,7 +219,7 @@ def index():
         coverage_tab = ui.tab('Coverage')
         rules_tab = ui.tab('Rules')
         inbox_tab = ui.tab('Inbox')
-        archive_tab = ui.tab('Archive / Completed')
+        archive_tab = ui.tab('Archived / Reviewed')
     with ui.tab_panels(tabs, value=inbox_tab).classes('w-full'):
         with ui.tab_panel(coverage_tab):
             ui.label('Vendors you want monitored').classes('text-lg font-semibold')
@@ -241,16 +241,22 @@ def index():
             show_coverage()
 
         with ui.tab_panel(rules_tab):
-            ui.label('Rules are scoped to vendor and product; baseline rules define the minimum supported version.').classes('text-sm text-gray-600')
-            with ui.row().classes('items-end gap-2'):
-                kind = ui.select(['exclude', 'baseline'], value='exclude', label='Kind').classes('w-32')
-                rvendor = ui.input('Vendor').classes('w-40')
-                rproduct = ui.input('Product').classes('w-40')
-                branch = ui.input('Branch').classes('w-32')
-                minimum = ui.input('Minimum version').classes('w-40')
-                reason = ui.input('Reason').classes('w-56')
+            ui.label('Rules apply to a vendor/product across all advisories; they are not a per-CVE status. Only provably irrelevant advisories auto-archive. Start from an advisory to prefill its affected product.').classes('text-sm text-gray-600')
+            with ui.row().classes('items-end gap-2 flex-wrap'):
+                kind = ui.select({'exclude': 'Not deployed (exclude)', 'baseline': 'Minimum deployed version'}, value='exclude', label='Rule type').classes('w-56')
+                rvendor = ui.input('NVD vendor').classes('w-40')
+                rproduct = ui.input('NVD product').classes('w-40')
+                branch = ui.input('Numeric branch (e.g. 17.6)').classes('w-48')
+                minimum = ui.input('Minimum deployed version').classes('w-48')
+                branch.set_visibility(False)
+                minimum.set_visibility(False)
+                kind.on_value_change(lambda e: (branch.set_visibility(e.value == 'baseline'), minimum.set_visibility(e.value == 'baseline')))
+                reason = ui.input('Reason (required for not deployed)').classes('w-64')
                 def add_rule():
-                    change(lambda: store.add_rule(kind.value, rvendor.value or '', rproduct.value or '', branch.value or '', minimum.value or '', reason.value or ''), show_rules.refresh)
+                    change(lambda: store.add_rule(kind.value, rvendor.value or '', rproduct.value or '',
+                                                  (branch.value or '') if kind.value == 'baseline' else '',
+                                                  (minimum.value or '') if kind.value == 'baseline' else '', reason.value or ''),
+                           lambda: (show_rules.refresh(), inbox_refresh(), archive_refresh()))
                 ui.button('Add rule', on_click=add_rule)
 
             @ui.refreshable
@@ -276,6 +282,36 @@ def index():
                 severity = ui.select(['', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NONE'], value='', label='Severity').classes('w-40')
                 ui.button('Filter', on_click=lambda: (page.update(offset=0), show_items.refresh())).props('outline')
             page = {'offset': 0}
+            def product_rule(cve_id):
+                pairs = store.advisory_products(cve_id)
+                with ui.dialog() as dialog, ui.card().classes('w-full max-w-lg'):
+                    ui.label(f'Create product rule from {cve_id}').classes('text-lg font-semibold')
+                    ui.label('Rules apply to this vendor/product across all advisories, not just this CVE. An advisory is archived only when every affected product is safely covered.').classes('text-sm')
+                    pair = ui.select({i: f"{p['vendor']} / {p['product']}" for i, p in enumerate(pairs)}, value=0, label='Affected product').classes('w-full')
+                    rule_kind = ui.select({'exclude': 'Not deployed (exclude)', 'baseline': 'Minimum deployed version'}, value='exclude', label='Rule type').classes('w-full')
+                    rule_branch = ui.input('Numeric branch (e.g. 17.6)').classes('w-full')
+                    rule_minimum = ui.input('Minimum deployed version (e.g. 17.6.6)').classes('w-full')
+                    rule_branch.set_visibility(False)
+                    rule_minimum.set_visibility(False)
+                    rule_kind.on_value_change(lambda e: (rule_branch.set_visibility(e.value == 'baseline'), rule_minimum.set_visibility(e.value == 'baseline')))
+                    rule_reason = ui.input('Reason (required for not deployed)').classes('w-full')
+                    def save_rule():
+                        selected = pairs[pair.value]
+                        try:
+                            store.add_rule(rule_kind.value, selected['vendor'], selected['product'],
+                                           rule_branch.value or '' if rule_kind.value == 'baseline' else '',
+                                           rule_minimum.value or '' if rule_kind.value == 'baseline' else '', rule_reason.value or '')
+                        except ValueError as exc:
+                            ui.notify(str(exc), type='negative')
+                            return
+                        dialog.close()
+                        show_items.refresh()
+                        show_rules.refresh()
+                        ui.notify('Product rule saved')
+                    with ui.row():
+                        ui.button('Create rule', on_click=save_rule)
+                        ui.button('Cancel', on_click=dialog.close).props('flat')
+                dialog.open()
 
             @ui.refreshable
             def show_items():
@@ -303,7 +339,7 @@ def index():
                         with ui.row().classes('items-center gap-3'):
                             ui.link(item['id'], f"https://nvd.nist.gov/vuln/detail/{item['id']}", new_tab=True).classes('font-semibold')
                             ui.badge(item.get('severity') or 'UNRATED')
-                            ui.label(item.get('state') or '')
+                            ui.label((item.get('disposition') or item.get('state') or '').replace('_', ' ').upper())
                             ui.label(f"Published {item.get('published') or '—'} · Modified {item.get('modified') or '—'}").classes('text-sm text-gray-600')
                             ui.label(item.get('products') or '').classes('text-sm text-gray-600')
                             if item.get('changed_since_review'):
@@ -311,15 +347,18 @@ def index():
                         ui.label(item.get('description') or '').classes('text-sm')
                         detail = ui.expansion('NVD details · CVSS, CWE, affected versions, references').classes('w-full')
                         detail.on_value_change(lambda e, cid=item['id'], exp=detail: load_nvd_detail(exp, cid) if e.value else None)
-                        if item.get('reason') or item.get('rule_ids') or item.get('evaluated_at'):
+                        if item.get('rule_ids'):
                             ui.label(f"Rule IDs: {item.get('rule_ids') or '—'} · {item.get('reason') or ''} · Evaluated {item.get('evaluated_at') or '—'}").classes('text-xs text-gray-500')
                         with ui.row().classes('w-full items-center gap-2'):
                             notes = ui.input('Notes', value=item.get('notes') or '').classes('flex-1')
                             ui.button('Save notes', on_click=lambda _, cid=item['id'], field=notes: change(lambda: store.set_notes(cid, field.value or ''), show_items.refresh)).props('flat')
-                            if state_filter == 'inbox' or state_filter == 'auto_archived':
-                                ui.button('Complete', on_click=lambda _, cid=item['id']: change(lambda: store.set_complete(cid, True), show_items.refresh)).props('outline')
-                            else:
-                                ui.button('Reopen', on_click=lambda _, cid=item['id']: change(lambda: store.set_complete(cid, False), show_items.refresh)).props('outline')
+                            for label, disposition in (('N/A', 'not_applicable'), ('Verified', 'verified'), ('Resolved', 'resolved')):
+                                if item.get('disposition') != disposition:
+                                    ui.button(label, on_click=lambda _, cid=item['id'], value=disposition: change(lambda: store.set_disposition(cid, value), show_items.refresh)).props('outline')
+                            if item.get('disposition'):
+                                ui.button('Reopen', on_click=lambda _, cid=item['id']: change(lambda: store.set_disposition(cid, None), show_items.refresh)).props('flat')
+                            if item.get('products'):
+                                ui.button('Create product rule', on_click=lambda _, cid=item['id']: product_rule(cid)).props('flat')
 
             def move(delta):
                 page['offset'] = max(0, page['offset'] + delta)
@@ -337,12 +376,12 @@ def index():
         with ui.tab_panel(archive_tab):
             with ui.tabs().classes('w-full') as archived_tabs:
                 archived = ui.tab('Archived')
-                completed = ui.tab('Completed')
+                completed = ui.tab('Reviewed')
             with ui.tab_panels(archived_tabs, value=archived).classes('w-full'):
                 with ui.tab_panel(archived):
                     archive_refresh = advisory_panel('auto_archived')
                 with ui.tab_panel(completed):
-                    completed_refresh = advisory_panel('completed')
+                    completed_refresh = advisory_panel('reviewed')
     tabs.on_value_change(lambda _: (inbox_refresh(), archive_refresh(), completed_refresh(), show_rules.refresh()))
     archived_tabs.on_value_change(lambda _: (archive_refresh(), completed_refresh()))
 

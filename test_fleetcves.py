@@ -40,14 +40,14 @@ class AdvisoryTest(unittest.TestCase):
         cve = advisory()
         self.assertEqual(self.sync(cve), 1)
         app.set_notes(cve['id'], 'investigating')
-        app.set_complete(cve['id'], True)
+        app.set_disposition(cve['id'], 'resolved')
         self.assertEqual(self.sync(cve), 1)
         updated = advisory(matches=[match('changed')], modified='2026-02-01T00:00:00.000Z')
         self.sync(updated)
-        entry = app.advisories(state='completed')[0]
+        entry = app.advisories(state='reviewed')[0]
         self.assertEqual(app.advisory_count(state='all'), 1)
         self.assertEqual(entry['notes'], 'investigating')
-        self.assertEqual(entry['state'], 'completed')
+        self.assertEqual(entry['disposition'], 'resolved')
         self.assertEqual(entry['changed_since_review'], 1)
         self.assertIn('changed', entry['products'])
 
@@ -96,6 +96,21 @@ class AdvisoryTest(unittest.TestCase):
         self.assertEqual(app.advisory_count(), 1)
         self.assertIsNone(app.advisories()[0]['rule_ids'])
 
+    def test_manual_dispositions_survive_sync_and_override_rules(self):
+        cve = advisory()
+        self.sync(cve)
+        app.set_disposition(cve['id'], 'verified')
+        app.add_rule('exclude', 'acme', 'router', reason='Not deployed')
+        self.assertEqual(app.advisories()[0]['disposition'], 'verified')
+        self.sync(advisory(modified='2026-02-01T00:00:00.000Z'))
+        self.assertEqual(app.advisories()[0]['changed_since_review'], 1)
+        app.set_disposition(cve['id'], 'not_applicable')
+        self.assertEqual(app.advisories(state='reviewed')[0]['disposition'], 'not_applicable')
+        app.set_disposition(cve['id'], 'resolved')
+        self.assertEqual(app.advisories(state='reviewed')[0]['disposition'], 'resolved')
+        app.set_disposition(cve['id'], None)
+        self.assertEqual(app.advisories(state='auto_archived')[0]['disposition'], None)
+
 
     def test_baseline_only_archives_below_boundary_and_manual_wins(self):
         below = advisory(matches=[match(versionStartIncluding='17.6.0', versionEndExcluding='17.6.4')])
@@ -105,10 +120,10 @@ class AdvisoryTest(unittest.TestCase):
         app.add_rule('baseline', 'acme', 'router', branch='17.6', minimum_version='17.6.6')
         self.assertEqual([x['id'] for x in app.advisories(state='auto_archived')], [below['id']])
         self.assertEqual(app.advisory_count(), 2)
-        app.set_complete(below['id'], True)
+        app.set_disposition(below['id'], 'resolved')
         app.delete_rule(1)
-        self.assertEqual(app.advisories(state='completed')[0]['state'], 'completed')
-        app.set_complete(below['id'], False)
+        self.assertEqual(app.advisories(state='reviewed')[0]['disposition'], 'resolved')
+        app.set_disposition(below['id'], None)
         self.assertEqual(app.advisory_count(), 3)
 
     def test_export_filters_and_neutralizes_spreadsheet_formulas(self):
@@ -152,6 +167,17 @@ class AdvisoryTest(unittest.TestCase):
         self.assertEqual(app.advisory_count(vendor='acme', product='router', state='all'), 1)
         self.assertEqual(app.advisory_detail(cve['id'])['configurations'], cve['configurations'])
 
+
+    def test_legacy_completed_record_is_not_relabelled_as_resolved(self):
+        self.sync(advisory())
+        with app.database() as db:
+            db.execute('UPDATE triage SET completed_at=?,reviewed_modified=? WHERE cve_id=?', (app.now(), '2026-01-01T00:00:00.000Z', 'CVE-2026-1234'))
+            db.execute('ALTER TABLE triage DROP COLUMN disposition')
+        app.initialize()
+        item = app.advisories(state='reviewed')[0]
+        self.assertEqual(item['disposition'], 'completed')
+        app.set_disposition(item['id'], None)
+        self.assertEqual(app.advisory_count(), 1)
 
     def test_legacy_database_preserves_status_and_original_tables(self):
         with app.database() as db:

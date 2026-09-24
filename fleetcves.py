@@ -70,8 +70,10 @@ def initialize():
             db.execute("INSERT INTO metadata VALUES ('advisory_products_v1','1')")
         db.execute('''CREATE TABLE IF NOT EXISTS triage (
             cve_id TEXT PRIMARY KEY REFERENCES cves(id), notes TEXT NOT NULL DEFAULT '',
-            completed_at TEXT, reviewed_modified TEXT, rule_ids TEXT,
+            completed_at TEXT, reviewed_modified TEXT, disposition TEXT, rule_ids TEXT,
             reason TEXT, evaluated_at TEXT)''')
+        if 'disposition' not in {row['name'] for row in db.execute('PRAGMA table_info(triage)')}:
+            db.execute('ALTER TABLE triage ADD COLUMN disposition TEXT')
         # Older databases placed user statuses on CPE/CVE edges. Copy them once onto
         # the durable advisory, without deleting the original tables or asserting a patch.
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='findings'").fetchone():
@@ -123,8 +125,8 @@ def _enabled(db):
 
 
 def _decision(db, ident, raw, rules):
-    record = db.execute('SELECT completed_at FROM triage WHERE cve_id=?', (ident,)).fetchone()
-    if record and record['completed_at']:
+    record = db.execute('SELECT completed_at,disposition FROM triage WHERE cve_id=?', (ident,)).fetchone()
+    if record and (record['completed_at'] or record['disposition'] == 'verified'):
         return
     result = evaluate(json.loads(raw), rules) if raw else None
     ids, reason = result if result else (None, None)
@@ -224,7 +226,7 @@ def rules_list():
 def reevaluate(db):
     active = _enabled(db)
     for row in db.execute('''SELECT c.id,c.raw FROM cves c LEFT JOIN triage t ON t.cve_id=c.id
-                             WHERE t.completed_at IS NULL''').fetchall():
+                             WHERE t.completed_at IS NULL AND t.disposition IS NULL''').fetchall():
         _decision(db, row['id'], row['raw'], active)
 
 
@@ -262,19 +264,22 @@ def set_notes(cve_id, notes):
         db.execute('INSERT INTO triage(cve_id,notes) VALUES (?,?) ON CONFLICT(cve_id) DO UPDATE SET notes=excluded.notes', (cve_id, notes))
 
 
-def set_complete(cve_id, complete):
+def set_disposition(cve_id, disposition):
+    if disposition not in (None, 'verified', 'not_applicable', 'resolved'):
+        raise ValueError('Unknown disposition')
     with database() as db:
         cve = db.execute('SELECT modified,raw FROM cves WHERE id=?', (cve_id,)).fetchone()
         if not cve:
             raise ValueError('Advisory not found')
-        if complete:
-            db.execute('''INSERT INTO triage(cve_id,completed_at,reviewed_modified,rule_ids,reason)
-                VALUES (?,?,?,NULL,NULL) ON CONFLICT(cve_id) DO UPDATE SET
-                completed_at=excluded.completed_at,reviewed_modified=excluded.reviewed_modified,
-                rule_ids=NULL,reason=NULL''', (cve_id, now(), cve['modified']))
-        else:
-            db.execute('UPDATE triage SET completed_at=NULL,reviewed_modified=NULL WHERE cve_id=?', (cve_id,))
+        if disposition is None:
+            db.execute('UPDATE triage SET disposition=NULL,completed_at=NULL,reviewed_modified=NULL WHERE cve_id=?', (cve_id,))
             _decision(db, cve_id, cve['raw'], _enabled(db))
+        else:
+            db.execute('''INSERT INTO triage(cve_id,disposition,completed_at,reviewed_modified,rule_ids,reason,evaluated_at)
+                VALUES (?,?,?,?,NULL,NULL,NULL) ON CONFLICT(cve_id) DO UPDATE SET
+                disposition=excluded.disposition,completed_at=excluded.completed_at,
+                reviewed_modified=excluded.reviewed_modified,rule_ids=NULL,reason=NULL,evaluated_at=NULL''',
+                (cve_id, disposition, now() if disposition != 'verified' else None, cve['modified']))
 
 
 def _where(search='', vendor='', product='', severity='', state='inbox', scope='all'):
@@ -296,7 +301,8 @@ def _where(search='', vendor='', product='', severity='', state='inbox', scope='
         clause.append('c.severity=?')
         params.append(severity)
     states = {'inbox': 't.completed_at IS NULL AND t.rule_ids IS NULL',
-              'completed': 't.completed_at IS NOT NULL',
+              'verified': "t.disposition='verified'",
+              'reviewed': 't.completed_at IS NOT NULL',
               'auto_archived': 't.completed_at IS NULL AND t.rule_ids IS NOT NULL',
               'all': '1=1'}
     if state not in states:
@@ -320,11 +326,13 @@ def advisory_count(search='', vendor='', product='', severity='', state='inbox',
 def advisories(search='', vendor='', product='', severity='', state='inbox', limit=50, offset=0, scope='all'):
     where, params = _where(search, vendor, product, severity, state, scope)
     return rows(f'''SELECT c.id,c.description,c.severity,c.published,c.modified,c.products,
-        CASE WHEN t.completed_at IS NOT NULL THEN 'completed'
+        CASE WHEN t.completed_at IS NOT NULL THEN 'reviewed'
              WHEN t.rule_ids IS NOT NULL THEN 'auto_archived' ELSE 'inbox' END AS state,
+        CASE WHEN t.completed_at IS NOT NULL AND t.disposition IS NULL THEN 'completed'
+             ELSE t.disposition END AS disposition,
         COALESCE(t.notes,'') AS notes,t.completed_at,t.reviewed_modified,t.rule_ids,
         t.reason,t.evaluated_at,
-        CASE WHEN t.completed_at IS NOT NULL AND c.modified != t.reviewed_modified THEN 1 ELSE 0 END AS changed_since_review
+        CASE WHEN t.reviewed_modified IS NOT NULL AND c.modified != t.reviewed_modified THEN 1 ELSE 0 END AS changed_since_review
         FROM cves c LEFT JOIN triage t ON t.cve_id=c.id WHERE {where}
         ORDER BY c.published DESC,c.id DESC LIMIT ? OFFSET ?''',
         (*params, min(max(int(limit), 1), 5000), max(int(offset), 0)))
@@ -335,18 +343,21 @@ def advisory_detail(cve_id):
         raise ValueError('Advisory not found')
     return json.loads(data[0]['raw']) if data[0]['raw'] else {}
 
+def advisory_products(cve_id):
+    return rows('SELECT vendor,product FROM advisory_products WHERE cve_id=? ORDER BY vendor,product', (cve_id,))
+
 
 def export_csv(search='', vendor='', product='', severity='', state='all', scope='all'):
     stream = io.StringIO()
     writer = csv.writer(stream)
-    writer.writerow(('CVE', 'Severity', 'Published', 'Modified', 'Vendor/Product', 'State',
+    writer.writerow(('CVE', 'Severity', 'Published', 'Modified', 'Vendor/Product', 'State', 'Disposition',
                      'Automatic rule IDs', 'Automatic reason', 'Notes', 'Completed'))
     offset = 0
     while True:
         batch = advisories(search, vendor, product, severity, state, 5000, offset, scope)
         for item in batch:
             fields = (item['id'], item['severity'], item['published'], item['modified'],
-                      item['products'], item['state'], item['rule_ids'], item['reason'],
+                      item['products'], item['state'], item['disposition'], item['rule_ids'], item['reason'],
                       item['notes'], item['completed_at'])
             writer.writerow([_csv_safe(field) for field in fields])
         offset += len(batch)
@@ -367,7 +378,7 @@ def main():
     sub.add_parser('serve')
     sub.add_parser('sync')
     listing = sub.add_parser('inbox')
-    listing.add_argument('--state', choices=['inbox', 'completed', 'auto_archived', 'all'], default='inbox')
+    listing.add_argument('--state', choices=['inbox', 'verified', 'reviewed', 'auto_archived', 'all'], default='inbox')
     listing.add_argument('--search', default='')
     sub.add_parser('coverage')
     add = sub.add_parser('add-coverage'); add.add_argument('vendor')
@@ -377,7 +388,7 @@ def main():
     rule.add_argument('--minimum-version', default=''); rule.add_argument('--reason', default='')
     disable = sub.add_parser('disable-rule'); disable.add_argument('id', type=int)
     remove = sub.add_parser('delete-rule'); remove.add_argument('id', type=int)
-    export = sub.add_parser('export'); export.add_argument('--state', choices=['inbox', 'completed', 'auto_archived', 'all'], default='all')
+    export = sub.add_parser('export'); export.add_argument('--state', choices=['inbox', 'verified', 'reviewed', 'auto_archived', 'all'], default='all')
     export.add_argument('--search', default=''); export.add_argument('--vendor', default='')
     export.add_argument('--product', default=''); export.add_argument('--severity', default='')
     args = parser.parse_args()

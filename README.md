@@ -1,6 +1,6 @@
 # FleetCVEs
 
-A small local advisory inbox backed by NVD, SQLite, NiceGUI, a JSON API, and a CLI. Advisories are imported broadly; explicit rules file away only those proven irrelevant. Everything uncertain stays in the Inbox for notes and manual completion. No CPE catalog download, asset inventory, or login is required.
+A small local advisory inbox backed by NVD, SQLite, NiceGUI, a JSON API, and a CLI. Advisories are imported broadly; explicit product rules file away only those proven irrelevant. Everything uncertain stays in the Inbox for review. No CPE catalog download, asset inventory, or login is required.
 
 ## Quick start
 
@@ -24,7 +24,9 @@ Two rules are supported:
 - **Product exclusion:** a vendor/product pair known not to be deployed, with an explicit reason. Every potentially affected product in a simple advisory must be covered before it can be auto-archived.
 - **Minimum deployed version:** a vendor/product, numeric branch (e.g. `17.6`), and minimum version (e.g. `17.6.6`). Only a simple affected range provably ending *before* the minimum on the same branch can be archived (e.g. `>=17.6.0, <17.6.4`). An inclusive end equal to the minimum is not safe. An upper-only range such as `<17.6.4` may also include older branches, so it stays in the Inbox unless NVD supplies an explicit same-branch lower bound. Unclear branches, wildcard-only versions, nonnumeric versions, complex configurations, and missing data stay in the Inbox.
 
-Auto-archive is **not** a patch or manual completion. Its rule IDs, explanation, and evaluation time are visible in Archive. Adding, disabling, or deleting rules re-evaluates automatic decisions, and changed NVD source data re-evaluates its advisory. Manual completion survives sync and rules; a completed advisory whose NVD modification time changes is flagged for review. Reopen it to apply current rules again. Rule lists show how many advisories each currently helps archive.
+Auto-archive is **not** a patch or manual disposition. Its rule IDs, explanation, and evaluation time are visible under **Archived**. From an advisory, use **Create product rule** to pick one of its affected NVD vendor/product pairs and choose an exclusion or minimum deployed version; the rule applies to that product across **all** advisories, not only the one you opened. Advisories with several affected products archive only when every product is safely covered. The Rules tab also permits manual entry. Adding, disabling, or deleting rules re-evaluates automatic decisions, as does changed NVD source data.
+
+Use **N/A** for an advisory manually judged not applicable, **Verified** for confirmed affected work that should remain in the Inbox, and **Resolved** after remediation. N/A and Resolved appear under **Archived / Reviewed → Reviewed**; Verified stays in the Inbox. All three survive sync and rule changes. A changed NVD modification time flags a manually reviewed advisory; **Reopen** clears its manual disposition and reapplies current product rules. Notes persist throughout.
 
 ## Configuration
 
@@ -42,7 +44,7 @@ Requests are serialized and spaced at least 6.1 seconds apart (0.65 with a key),
 ```bash
 fleetcves sync
 fleetcves inbox --state inbox
-fleetcves inbox --state completed --search CVE-2026
+fleetcves inbox --state reviewed --search CVE-2026
 fleetcves add-coverage cisco
 fleetcves coverage
 fleetcves add-rule exclude cisco unused_product --reason 'Not deployed'
@@ -54,26 +56,26 @@ fleetcves export --state inbox --vendor cisco > inbox.csv
 fleetcves --db /path/to/fleet.sqlite3 sync
 ```
 
-`export` also accepts `--search`, `--product`, `--severity`, and `--state all|inbox|completed|auto_archived`. CSV includes source and decision data and prefixes formula-like cells to protect spreadsheet readers.
+`export` also accepts `--search`, `--product`, `--severity`, and `--state all|inbox|verified|reviewed|auto_archived`. CSV includes source, disposition, and decision data and prefixes formula-like cells to protect spreadsheet readers.
 
 ## JSON API
 
-The localhost server exposes GET /api/advisories (search, vendor, product, severity, state, limit, offset, scope), GET /api/advisories/count, GET /api/advisories/{cve_id} (full stored NVD record), GET /api/export.csv (same filters), coverage and rules CRUD routes, and advisory notes/completion updates. scope=covered|unmapped|all defaults to all for API compatibility; the UI defaults to covered. The UI and CLI share one SQLite file.
+The localhost server exposes GET /api/advisories (search, vendor, product, severity, state, limit, offset, scope), GET /api/advisories/count, GET /api/advisories/{cve_id} (full stored NVD record), GET /api/export.csv (same filters), coverage and rules CRUD routes, and advisory notes/disposition updates. scope=covered|unmapped|all defaults to all for API compatibility; the UI defaults to covered. The UI and CLI share one SQLite file.
 
 For a local integration, for example:
 
 ```bash
 curl 'http://127.0.0.1:8080/api/advisories?state=inbox&vendor=cisco&severity=HIGH'
 curl -X POST http://127.0.0.1:8080/api/coverage -H 'Content-Type: application/json' -d '{"vendor":"cisco"}'
-curl -X PUT http://127.0.0.1:8080/api/advisories/CVE-2026-1234/complete -H 'Content-Type: application/json' -d '{"complete":true}'
+curl -X PUT http://127.0.0.1:8080/api/advisories/CVE-2026-1234/disposition -H 'Content-Type: application/json' -d '{"disposition":"verified"}'
 curl -o inbox.csv 'http://127.0.0.1:8080/api/export.csv?state=inbox&vendor=cisco'
 ```
 
-In the UI, complete an Inbox item after review; reopen it from **Archive / Completed → Completed**. Automatic decisions appear separately under **Archived**, with the matching rule IDs and explanation. Filtering and CSV export use the selected view's filters; no advisory is deleted by a rule.
+In the UI, choose N/A, Verified, or Resolved on an advisory; change status or reopen it under **Archived / Reviewed → Reviewed**. The API accepts `not_applicable`, `verified`, `resolved`, or `null` to reopen. Automatic decisions appear separately under **Archived**, with matching rule IDs and explanations. Filtering and CSV export use the selected view's filters; no advisory is deleted by a rule.
 
 ## Existing databases
 
-Schema initialization is idempotent. Existing cves rows gain raw JSON and display product columns; vulnerable CPE vendor/product pairs are indexed from stored raw NVD records once on upgrade and updated on source corrections. Old CPE catalog, findings, and statuses tables are left intact. Nonempty legacy per-CPE statuses are copied into advisory notes, retaining their CPE names; they are **not** assumed to mean manual completion. Historical CVEs without raw configurations appear under **No product mapping** until NVD imports them. Old CPE tracking/polling commands are removed; a fresh advisory sync is needed for complete coverage.
+Schema initialization is idempotent. Existing cves rows gain raw JSON and display product columns; vulnerable CPE vendor/product pairs are indexed from stored raw NVD records once on upgrade and updated on source corrections. Existing manually completed advisories remain under Reviewed with the legacy **Completed** label; they are not silently reclassified as Resolved. Old CPE catalog, findings, and statuses tables are left intact. Nonempty legacy per-CPE statuses are copied into advisory notes, retaining their CPE names; they are **not** assumed to mean manual completion. Historical CVEs without raw configurations appear under **No product mapping** until NVD imports them. Old CPE tracking/polling commands are removed; a fresh advisory sync is needed for complete coverage.
 
 ## Check
 
