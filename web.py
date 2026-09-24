@@ -1,11 +1,11 @@
-"""NiceGUI browser and localhost JSON API for FleetCVEs."""
-
+"""NiceGUI advisory inbox and localhost JSON API for FleetCVEs."""
 import asyncio
 import logging
 import os
-import sqlite3
+from urllib.parse import urlencode
 
 from fastapi import HTTPException
+from fastapi.responses import Response
 from nicegui import app, ui
 from pydantic import BaseModel
 
@@ -13,212 +13,293 @@ import fleetcves as store
 
 log = logging.getLogger(__name__)
 sync_state = 'Waiting for NVD sync'
+_sync_task = None
 
 
-class Toggle(BaseModel):
+class Enabled(BaseModel):
     enabled: bool
 
 
-class StatusChange(BaseModel):
-    cpe_name: str
-    cve_id: str
-    status: str | None = None
+class Coverage(BaseModel):
+    vendor: str
 
 
-class NewStatus(BaseModel):
-    name: str
+class Rule(BaseModel):
+    kind: str
+    vendor: str
+    product: str
+    branch: str = ''
+    minimum_version: str = ''
+    reason: str = ''
+
+
+class Notes(BaseModel):
+    notes: str
+
+
+class Complete(BaseModel):
+    complete: bool
 
 
 def apply(fn, *args):
     try:
-        fn(*args)
+        return fn(*args)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get('/api/cpes')
-def api_cpes(search: str = '', limit: int = 100, offset: int = 0):
-    return store.catalog(search, limit, offset)
+@app.get('/api/advisories')
+def api_advisories(search: str = '', vendor: str = '', product: str = '', severity: str = '', state: str = 'inbox', limit: int = 50, offset: int = 0):
+    return store.advisories(search, vendor, product, severity, state, limit, offset)
 
 
-@app.get('/api/cpes/count')
-def api_cpe_count(search: str = ''):
-    return {'total': store.catalog_count(search)}
+@app.get('/api/advisories/count')
+def api_advisory_count(search: str = '', vendor: str = '', product: str = '', severity: str = '', state: str = 'inbox'):
+    return {'total': store.advisory_count(search, vendor, product, severity, state)}
 
 
-@app.put('/api/cpes/{name:path}/tracked')
-def api_track(name: str, change: Toggle):
-    apply(store.track, name, change.enabled)
+@app.put('/api/advisories/{cve_id}/notes')
+def api_notes(cve_id: str, data: Notes):
+    apply(store.set_notes, cve_id, data.notes)
     return {'ok': True}
 
 
-@app.put('/api/cpes/{name:path}/in-use')
-def api_in_use(name: str, change: Toggle):
-    apply(store.set_in_use, name, change.enabled)
+@app.put('/api/advisories/{cve_id}/complete')
+def api_complete(cve_id: str, data: Complete):
+    apply(store.set_complete, cve_id, data.complete)
     return {'ok': True}
 
 
-@app.get('/api/findings')
-def api_findings():
-    return store.findings()
+@app.get('/api/coverage')
+def api_coverage():
+    return store.coverage()
 
 
-@app.get('/api/statuses')
-def api_statuses():
-    return store.rows('SELECT name FROM statuses ORDER BY name')
-
-
-@app.post('/api/statuses', status_code=201)
-def api_new_status(data: NewStatus):
-    apply(store.add_status, data.name)
+@app.post('/api/coverage', status_code=201)
+def api_add_coverage(data: Coverage):
+    apply(store.add_coverage, data.vendor)
     return {'ok': True}
 
 
-@app.put('/api/findings/status')
-def api_status(data: StatusChange):
-    apply(store.set_status, data.cpe_name, data.cve_id, data.status)
+@app.delete('/api/coverage/{vendor:path}')
+def api_remove_coverage(vendor: str):
+    apply(store.remove_coverage, vendor)
     return {'ok': True}
+
+
+@app.get('/api/rules')
+def api_rules():
+    return store.rules_list()
+
+
+@app.post('/api/rules', status_code=201)
+def api_add_rule(data: Rule):
+    return {'id': apply(store.add_rule, data.kind, data.vendor, data.product, data.branch, data.minimum_version, data.reason)}
+
+
+@app.put('/api/rules/{rule_id}/enabled')
+def api_rule_enabled(rule_id: int, data: Enabled):
+    apply(store.set_rule_enabled, rule_id, data.enabled)
+    return {'ok': True}
+
+
+@app.delete('/api/rules/{rule_id}')
+def api_delete_rule(rule_id: int):
+    apply(store.delete_rule, rule_id)
+    return {'ok': True}
+
+
+@app.get('/api/export')
+@app.get('/api/export.csv')
+def api_export_csv(search: str = '', vendor: str = '', product: str = '', severity: str = '', state: str = 'all'):
+    return Response(store.export_csv(search, vendor, product, severity, state), media_type='text/csv; charset=utf-8',
+                    headers={'Content-Disposition': 'attachment; filename="advisories.csv"'})
+
+
+async def run_sync():
+    global sync_state, _sync_task
+    if _sync_task and not _sync_task.done():
+        return
+
+    def progress(*args):
+        global sync_state
+        sync_state = f'Syncing NVD advisories ({args[0]:,} processed)…' if args and isinstance(args[0], int) else 'Syncing NVD advisories…'
+
+    async def work():
+        global sync_state
+        sync_state = 'Syncing NVD advisories…'
+        try:
+            count = await asyncio.to_thread(store.sync_advisories, progress)
+            sync_state = f'Advisories synced ({count:,}); last sync {store.now()}'
+        except Exception as exc:
+            sync_state = f'NVD sync failed: {exc}'
+            log.exception('Advisory sync failed')
+
+    _sync_task = asyncio.create_task(work())
 
 
 async def sync_worker():
-    global sync_state
-
-    def progress(imported, page_done, page_total):
-        global sync_state
-        sync_state = f'Syncing CPE catalog: {imported:,} processed (current batch {page_done:,}/{page_total:,})'
-
     while True:
-        sync_state = 'Syncing CPE catalog from NVD…'
-        try:
-            count = await asyncio.to_thread(store.sync_cpes, progress)
-            sync_state = f'Catalog updated ({count} CPE records); last sync {store.now()}'
-        except Exception as exc:
-            sync_state = f'NVD sync failed: {exc}'
-            log.exception('CPE sync failed; will retry')
+        await run_sync()
+        if _sync_task:
+            await _sync_task
         await asyncio.sleep(3600)
 
 
-async def poll_worker():
-    while True:
-        try:
-            await asyncio.to_thread(store.poll_due)
-        except Exception:
-            log.exception('Vulnerability polling failed; will retry')
-        await asyncio.sleep(30)
+@app.post('/api/sync')
+async def api_sync():
+    await run_sync()
+    return {'ok': True, 'state': sync_state}
+
+
+@app.get('/api/sync')
+def api_sync_status():
+    return {'state': sync_state}
 
 
 @app.on_startup
 async def startup():
     store.initialize()
     asyncio.create_task(sync_worker())
-    asyncio.create_task(poll_worker())
+
+
+def change(action, refresh):
+    try:
+        action()
+        refresh()
+    except (ValueError, KeyError) as exc:
+        ui.notify(str(exc), type='negative')
 
 
 @ui.page('/')
 def index():
-    ui.page_title('FleetCVEs')
+    ui.page_title('FleetCVEs — Advisory inbox')
     ui.label('FleetCVEs').classes('text-3xl font-bold')
-    ui.label('Local NVD catalog and vulnerability triage').classes('text-gray-600')
-    ui.label().bind_text_from(globals(), 'sync_state').classes('text-sm text-gray-600')
+    with ui.row().classes('items-center gap-3'):
+        ui.label().bind_text_from(globals(), 'sync_state').classes('text-sm text-gray-600')
+        ui.button('Sync now', on_click=lambda: asyncio.create_task(run_sync())).props('outline')
 
     with ui.tabs().classes('w-full') as tabs:
-        catalog_tab = ui.tab('CPE catalog')
-        findings_tab = ui.tab('Findings')
-        statuses_tab = ui.tab('Statuses')
-    with ui.tab_panels(tabs, value=catalog_tab).classes('w-full'):
-        with ui.tab_panel(catalog_tab):
-            page = {'index': 0}
-
-            def search_catalog():
-                page['index'] = 0
-                show_cpes.refresh()
-
-            def navigate(step):
-                page['index'] += step
-                show_cpes.refresh()
-
-            with ui.row().classes('items-center'):
-                search = ui.input('Search CPE name or title').props('clearable').classes('w-96')
-                search.on('keydown.enter', search_catalog)
-                ui.button('Search', on_click=search_catalog)
-            ui.label('Select versions to track; uncheck In use to hide their findings.').classes('text-sm text-gray-600')
+        coverage_tab = ui.tab('Coverage')
+        rules_tab = ui.tab('Rules')
+        inbox_tab = ui.tab('Inbox')
+        archive_tab = ui.tab('Archive / Completed')
+    with ui.tab_panels(tabs, value=inbox_tab).classes('w-full'):
+        with ui.tab_panel(coverage_tab):
+            ui.label('Vendors you want monitored').classes('text-lg font-semibold')
+            vendor_input = ui.input('Vendor').classes('w-80')
 
             @ui.refreshable
-            def show_cpes():
-                query = search.value or ''
-                total = store.catalog_count(query)
-                page['index'] = min(page['index'], max(0, (total - 1) // 50))
-                offset = page['index'] * 50
-                entries = store.catalog(query, 50, offset)
-                with ui.row().classes('items-center gap-3'):
-                    ui.label(f'Showing {offset + 1}–{offset + len(entries)} of {total:,}' if total else '0 matching CPEs')
-                    previous = ui.button('Previous', on_click=lambda: navigate(-1))
-                    if offset == 0:
-                        previous.props('disable')
-                    ui.label(f'Page {page["index"] + 1} of {max(1, (total + 49) // 50)}')
-                    following = ui.button('Next', on_click=lambda: navigate(1))
-                    if offset + 50 >= total:
-                        following.props('disable')
-                if not entries:
-                    ui.label('No CPEs yet. The initial NVD sync runs in the background.' if not query else 'No CPEs match this search.').classes('text-gray-600')
-                for item in entries:
-                    with ui.row().classes('w-full items-center gap-4 border-b py-2'):
-                        with ui.column().classes('flex-1 gap-0'):
-                            ui.label(f"{item['vendor']} / {item['product']} / {item['version']}").classes('font-medium')
-                            ui.label(item['name']).classes('text-xs text-gray-500 break-all')
-                        ui.checkbox('Track', value=bool(item['tracked']),
-                                    on_change=lambda e, name=item['name']: (store.track(name, e.value), show_cpes.refresh()))
-                        if item['tracked']:
-                            ui.checkbox('In use', value=bool(item['in_use']),
-                                        on_change=lambda e, name=item['name']: (store.set_in_use(name, e.value), show_findings.refresh()))
-            show_cpes()
+            def show_coverage():
+                for item in store.coverage():
+                    vendor = item['vendor'] if isinstance(item, dict) else item
+                    with ui.row().classes('items-center gap-3 border-b py-2'):
+                        ui.label(vendor).classes('flex-1')
+                        ui.button('Remove', on_click=lambda _, v=vendor: change(lambda: store.remove_coverage(v), show_coverage.refresh)).props('flat color=negative')
 
-        with ui.tab_panel(findings_tab):
-            ui.label('Findings for tracked versions in use').classes('text-xl font-semibold')
+            def add_vendor():
+                change(lambda: store.add_coverage(vendor_input.value or ''), show_coverage.refresh)
+                vendor_input.value = ''
+            vendor_input.on('keydown.enter', lambda: add_vendor())
+            ui.button('Add vendor', on_click=add_vendor)
+            show_coverage()
+
+        with ui.tab_panel(rules_tab):
+            ui.label('Rules are scoped to vendor and product; baseline rules define the minimum supported version.').classes('text-sm text-gray-600')
+            with ui.row().classes('items-end gap-2'):
+                kind = ui.select(['exclude', 'baseline'], value='exclude', label='Kind').classes('w-32')
+                rvendor = ui.input('Vendor').classes('w-40')
+                rproduct = ui.input('Product').classes('w-40')
+                branch = ui.input('Branch').classes('w-32')
+                minimum = ui.input('Minimum version').classes('w-40')
+                reason = ui.input('Reason').classes('w-56')
+                def add_rule():
+                    change(lambda: store.add_rule(kind.value, rvendor.value or '', rproduct.value or '', branch.value or '', minimum.value or '', reason.value or ''), show_rules.refresh)
+                ui.button('Add rule', on_click=add_rule)
 
             @ui.refreshable
-            def show_findings():
-                entries = store.findings()
-                if not entries:
-                    ui.label('No findings yet. Track a CPE and allow the poller to query NVD.').classes('text-gray-600')
-                options = ['Unreviewed'] + [r['name'] for r in store.rows('SELECT name FROM statuses ORDER BY name')]
-                for finding in entries:
+            def show_rules():
+                for rule in store.rules_list():
+                    with ui.row().classes('w-full items-center gap-3 border-b py-2'):
+                        ui.checkbox(value=bool(rule['enabled']), on_change=lambda e, rid=rule['id']: change(lambda: store.set_rule_enabled(rid, e.value), show_rules.refresh))
+                        ui.label(f"{rule['kind']}: {rule['vendor']} / {rule['product']}" + (f" / {rule['branch']}" if rule['branch'] else '')).classes('flex-1')
+                        if rule.get('minimum_version'):
+                            ui.label(f"≥ {rule['minimum_version']}").classes('text-sm')
+                        if rule.get('reason'):
+                            ui.label(rule['reason']).classes('text-sm text-gray-600')
+                        ui.label(f"{rule.get('archived_count', 0)} archived").classes('text-xs text-gray-500')
+                        ui.button('Delete', on_click=lambda _, rid=rule['id']: change(lambda: store.delete_rule(rid), show_rules.refresh)).props('flat color=negative')
+            show_rules()
+
+        def advisory_panel(state_filter):
+            search = ui.input('Search advisories').props('clearable').classes('w-64')
+            vendor = ui.input('Vendor').props('clearable').classes('w-40')
+            product = ui.input('Product').props('clearable').classes('w-40')
+            severity = ui.select(['', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NONE'], value='', label='Severity').classes('w-40')
+            page = {'offset': 0}
+
+            @ui.refreshable
+            def show_items():
+                query = dict(search=search.value or '', vendor=vendor.value or '', product=product.value or '', severity=severity.value or '', state=state_filter, limit=50, offset=page['offset'])
+                total = store.advisory_count(**{k: query[k] for k in ('search', 'vendor', 'product', 'severity', 'state')})
+                items = store.advisories(**query)
+                with ui.row().classes('items-center gap-2'):
+                    ui.label(f'{total:,} advisories')
+                    prev = ui.button('Previous', on_click=lambda: move(-50)).props('flat')
+                    prev.set_visibility(page['offset'] > 0)
+                    next_page = ui.button('Next', on_click=lambda: move(50)).props('flat')
+                    next_page.set_visibility(page['offset'] + 50 < total)
+                    csv_query = urlencode({k: v for k, v in query.items() if k not in ('limit', 'offset')})
+                    ui.button('Export CSV', on_click=lambda: ui.download('/api/export?' + csv_query)).props('outline')
+                if not items:
+                    ui.label('No matching advisories.').classes('text-gray-600')
+                for item in items:
                     with ui.column().classes('w-full border-b py-3 gap-1'):
                         with ui.row().classes('items-center gap-3'):
-                            ui.link(finding['cve_id'], f"https://nvd.nist.gov/vuln/detail/{finding['cve_id']}", new_tab=True).classes('font-bold')
-                            ui.badge(finding['severity'] or 'UNRATED')
-                            ui.label(f"{finding['vendor']} / {finding['product']} / {finding['version']}")
-                            ui.select(options, value=finding['status'] or 'Unreviewed', label='Status',
-                                      on_change=lambda e, f=finding: store.set_status(f['cpe_name'], f['cve_id'], None if e.value == 'Unreviewed' else e.value)).classes('w-44')
-                        ui.label(finding['description']).classes('text-sm')
-            show_findings()
+                            ui.link(item['id'], f"https://nvd.nist.gov/vuln/detail/{item['id']}", new_tab=True).classes('font-semibold')
+                            ui.badge(item.get('severity') or 'UNRATED')
+                            ui.label(item.get('state') or '')
+                            ui.label(f"Published {item.get('published') or '—'} · Modified {item.get('modified') or '—'}").classes('text-sm text-gray-600')
+                            ui.label(item.get('products') or '').classes('text-sm text-gray-600')
+                            if item.get('changed_since_review'):
+                                ui.badge('Changed since review', color='orange')
+                        ui.label(item.get('description') or '').classes('text-sm')
+                        if item.get('reason') or item.get('rule_ids') or item.get('evaluated_at'):
+                            ui.label(f"Rule IDs: {item.get('rule_ids') or '—'} · {item.get('reason') or ''} · Evaluated {item.get('evaluated_at') or '—'}").classes('text-xs text-gray-500')
+                        with ui.row().classes('w-full items-center gap-2'):
+                            notes = ui.input('Notes', value=item.get('notes') or '').classes('flex-1')
+                            ui.button('Save notes', on_click=lambda _, cid=item['id'], field=notes: change(lambda: store.set_notes(cid, field.value or ''), show_items.refresh)).props('flat')
+                            if state_filter == 'inbox' or state_filter == 'auto_archived':
+                                ui.button('Complete', on_click=lambda _, cid=item['id']: change(lambda: store.set_complete(cid, True), show_items.refresh)).props('outline')
+                            else:
+                                ui.button('Reopen', on_click=lambda _, cid=item['id']: change(lambda: store.set_complete(cid, False), show_items.refresh)).props('outline')
 
-        with ui.tab_panel(statuses_tab):
-            ui.label('Custom finding statuses').classes('text-xl font-semibold')
-            with ui.row().classes('items-center'):
-                label = ui.input('New status')
+            def move(delta):
+                page['offset'] = max(0, page['offset'] + delta)
+                show_items.refresh()
+            for field in (search, vendor, product):
+                field.on('keydown.enter', lambda: (page.update(offset=0), show_items.refresh()))
+            severity.on_value_change(lambda _: (page.update(offset=0), show_items.refresh()))
+            ui.button('Filter', on_click=lambda: (page.update(offset=0), show_items.refresh())).props('outline')
+            show_items()
+            ui.timer(30, show_items.refresh)
+            return show_items.refresh
 
-                def create_status():
-                    try:
-                        store.add_status(label.value)
-                        label.value = ''
-                        show_statuses.refresh()
-                        show_findings.refresh()
-                    except (ValueError, sqlite3.IntegrityError) as exc:
-                        ui.notify(str(exc), type='negative')
-
-                ui.button('Add', on_click=create_status)
-
-            @ui.refreshable
-            def show_statuses():
-                for row in store.rows('SELECT name FROM statuses ORDER BY name'):
-                    ui.label(row['name'])
-            show_statuses()
-
-    ui.timer(15, lambda: (show_cpes.refresh(), show_findings.refresh()))
+        with ui.tab_panel(inbox_tab):
+            inbox_refresh = advisory_panel('inbox')
+        with ui.tab_panel(archive_tab):
+            with ui.tabs().classes('w-full') as archived_tabs:
+                archived = ui.tab('Archived')
+                completed = ui.tab('Completed')
+            with ui.tab_panels(archived_tabs, value=archived).classes('w-full'):
+                with ui.tab_panel(archived):
+                    archive_refresh = advisory_panel('auto_archived')
+                with ui.tab_panel(completed):
+                    completed_refresh = advisory_panel('completed')
+    tabs.on_value_change(lambda _: (inbox_refresh(), archive_refresh(), completed_refresh(), show_rules.refresh()))
+    archived_tabs.on_value_change(lambda _: (archive_refresh(), completed_refresh()))
 
 
 def run():
     store.initialize()
-    ui.run(host='127.0.0.1', port=int(os.environ.get('FLEETCVES_PORT', 8080)),
-           reload=False, show=False)
+    ui.run(host='127.0.0.1', port=int(os.environ.get('FLEETCVES_PORT', 8080)), reload=False, show=False)

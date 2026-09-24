@@ -1,6 +1,7 @@
-"""Local NVD catalog and vulnerability tracker; run `python -m fleetcves --help`."""
-
+"""Local NVD advisory inbox; run `python -m fleetcves --help`."""
 import argparse
+import csv
+import io
 import json
 import os
 import re
@@ -13,10 +14,13 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from rules import evaluate
+
 DB_PATH = Path(os.environ.get('FLEETCVES_DB', 'fleetcves.sqlite3'))
 NVD_BASE = os.environ.get('NVD_API_BASE', 'https://services.nvd.nist.gov/rest/json').rstrip('/')
 _last_request = 0.0
 _request_lock = threading.Lock()
+_sync_lock = threading.Lock()
 
 
 def now():
@@ -41,30 +45,30 @@ def database():
 
 def initialize():
     with database() as db:
-        db.executescript('''
-            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS cpes (
-                name TEXT PRIMARY KEY, title TEXT NOT NULL, vendor TEXT NOT NULL,
-                product TEXT NOT NULL, version TEXT NOT NULL, modified TEXT NOT NULL,
-                deprecated INTEGER NOT NULL DEFAULT 0, tracked INTEGER NOT NULL DEFAULT 0,
-                in_use INTEGER NOT NULL DEFAULT 1, polled_at TEXT
-            );
-            DROP INDEX IF EXISTS cpes_search;
-            CREATE INDEX IF NOT EXISTS cpes_catalog ON cpes(deprecated, tracked DESC, vendor, product, version, name);
-            CREATE TABLE IF NOT EXISTS statuses (name TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS cves (
-                id TEXT PRIMARY KEY, description TEXT NOT NULL, severity TEXT,
-                published TEXT, modified TEXT
-            );
-            CREATE TABLE IF NOT EXISTS findings (
-                cpe_name TEXT NOT NULL REFERENCES cpes(name),
-                cve_id TEXT NOT NULL REFERENCES cves(id),
-                status TEXT REFERENCES statuses(name),
-                PRIMARY KEY(cpe_name, cve_id)
-            );
-        ''')
-        db.executemany('INSERT OR IGNORE INTO statuses VALUES (?)',
-                       [('mitigated',), ('not applicable',), ('patched',)])
+        db.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        db.execute('''CREATE TABLE IF NOT EXISTS cves (
+            id TEXT PRIMARY KEY, description TEXT NOT NULL, severity TEXT,
+            published TEXT, modified TEXT, raw TEXT, products TEXT NOT NULL DEFAULT '')''')
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(cves)')}
+        if 'raw' not in columns:
+            db.execute('ALTER TABLE cves ADD COLUMN raw TEXT')
+        if 'products' not in columns:
+            db.execute("ALTER TABLE cves ADD COLUMN products TEXT NOT NULL DEFAULT ''")
+        db.execute('CREATE TABLE IF NOT EXISTS coverage (vendor TEXT PRIMARY KEY COLLATE NOCASE)')
+        db.execute('''CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('exclude','baseline')),
+            vendor TEXT NOT NULL, product TEXT NOT NULL, branch TEXT,
+            minimum_version TEXT, reason TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS triage (
+            cve_id TEXT PRIMARY KEY REFERENCES cves(id), notes TEXT NOT NULL DEFAULT '',
+            completed_at TEXT, reviewed_modified TEXT, rule_ids TEXT,
+            reason TEXT, evaluated_at TEXT)''')
+        # Older databases placed user statuses on CPE/CVE edges. Copy them once onto
+        # the durable advisory, without deleting the original tables or asserting a patch.
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='findings'").fetchone():
+            db.execute('''INSERT OR IGNORE INTO triage(cve_id,notes)
+                SELECT cve_id, group_concat(cpe_name || ': ' || status, '; ')
+                FROM findings WHERE status IS NOT NULL GROUP BY cve_id''')
 
 
 def rows(sql, params=()):
@@ -74,172 +78,279 @@ def rows(sql, params=()):
 
 def request(endpoint, params):
     global _last_request
-    # NVD's public limit is 5 requests / 30 seconds; API keys allow 50 / 30 seconds.
     with _request_lock:
+        # 5 / 30s public, 50 / 30s keyed; serialized even across UI and CLI threads.
         interval = 0.65 if os.environ.get('NVD_API_KEY') else 6.1
         delay = interval - (time.monotonic() - _last_request)
         if delay > 0:
             time.sleep(delay)
-        headers = {'User-Agent': 'FleetCVEs/0.1'}
+        headers = {'User-Agent': 'FleetCVEs/0.2'}
         if os.environ.get('NVD_API_KEY'):
             headers['apiKey'] = os.environ['NVD_API_KEY']
-        req = Request(f'{NVD_BASE}/{endpoint}?{urlencode(params)}', headers=headers)
         _last_request = time.monotonic()
-        with urlopen(req, timeout=45) as response:
+        with urlopen(Request(f'{NVD_BASE}/{endpoint}?{urlencode(params)}', headers=headers), timeout=45) as response:
             return json.load(response)
 
 
-def sync_cpes(on_progress=None):
-    """Page the entire catalog initially; later query bounded modification windows.
+def _matches(cve):
+    """Index only the displayed products; raw configurations remain authoritative."""
+    found = set()
+    def visit(node):
+        for match in node.get('cpeMatch', []):
+            if match.get('vulnerable') is True:
+                parts = re.split(r'(?<!\\):', match.get('criteria', ''))
+                if len(parts) == 13 and parts[:2] == ['cpe', '2.3']:
+                    found.add((parts[3], parts[4]))
+        for child in node.get('children', []):
+            visit(child)
+    for configuration in cve.get('configurations', []):
+        for node in configuration.get('nodes', []):
+            visit(node)
+    return ', '.join(f'{vendor}/{product}' for vendor, product in sorted(found))
 
-    Cursor advances only after a full window, so a failed run safely replays it.
+
+def _enabled(db):
+    return [dict(row) for row in db.execute('SELECT * FROM rules WHERE enabled=1 ORDER BY id')]
+
+
+def _decision(db, ident, raw, rules):
+    record = db.execute('SELECT completed_at FROM triage WHERE cve_id=?', (ident,)).fetchone()
+    if record and record['completed_at']:
+        return
+    result = evaluate(json.loads(raw), rules) if raw else None
+    ids, reason = result if result else (None, None)
+    db.execute('''INSERT INTO triage(cve_id,rule_ids,reason,evaluated_at) VALUES (?,?,?,?)
+        ON CONFLICT(cve_id) DO UPDATE SET rule_ids=excluded.rule_ids,
+        reason=excluded.reason,evaluated_at=excluded.evaluated_at''',
+        (ident, json.dumps(ids) if ids else None, reason, now()))
+
+
+def sync_advisories(on_progress=None):
+    """Download all CVEs initially; replay overlapping modification windows thereafter.
+
+    A window is never checkpointed until every page in the whole run succeeds.
     """
-    initialize()
-    cursor = rows("SELECT value FROM metadata WHERE key='cpe_cursor'")
-    end = now()
-    start = datetime.fromisoformat(cursor[0]['value'].replace('Z', '+00:00')) - timedelta(seconds=1) if cursor else None
-    total = 0
-    while True:
-        window_end = min(start + timedelta(days=119), datetime.fromisoformat(end.replace('Z', '+00:00'))) if start else None
-        params = {'resultsPerPage': 10000}
-        if start:
-            params.update(lastModStartDate=start.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-                          lastModEndDate=window_end.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
-        index = 0
+    with _sync_lock:
+        initialize()
+        cursor = rows("SELECT value FROM metadata WHERE key='advisory_cursor'")
+        end = datetime.now(timezone.utc)
+        start = datetime.fromisoformat(cursor[0]['value'].replace('Z', '+00:00')) - timedelta(seconds=1) if cursor else None
+        total = 0
         while True:
-            data = request('cpes/2.0', {**params, 'startIndex': index})
-            items = data['products']
-            with database() as db:
-                for item in items:
-                    cpe = item['cpe']
-                    name = cpe['cpeName']
-                    parts = re.split(r'(?<!\\):', name)
-                    db.execute('''INSERT INTO cpes(name,title,vendor,product,version,modified,deprecated)
-                        VALUES (?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET
-                        title=excluded.title, modified=excluded.modified, deprecated=excluded.deprecated''',
-                        (name, next((t['title'] for t in cpe.get('titles', []) if t.get('lang') == 'en'), name),
-                         parts[3], parts[4], parts[5], cpe['lastModified'], int(cpe.get('deprecated', False))))
-            total += len(items)
-            index += len(items)
-            if on_progress:
-                on_progress(total, index, data['totalResults'])
-            if not items or index >= data['totalResults']:
+            window_end = min(start + timedelta(days=119), end) if start else None
+            params = {'resultsPerPage': 2000}
+            if start:
+                params.update(lastModStartDate=start.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                              lastModEndDate=window_end.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+            index = 0
+            while True:
+                data = request('cves/2.0', {**params, 'startIndex': index})
+                items = data['vulnerabilities']
+                count = data['totalResults']
+                if not items and index < count:
+                    raise ValueError('NVD returned an incomplete advisory page')
+                with database() as db:
+                    active = _enabled(db)
+                    for item in items:
+                        cve = item['cve']
+                        ident = cve['id']
+                        raw = json.dumps(cve, separators=(',', ':'), sort_keys=True)
+                        metrics = cve.get('metrics', {})
+                        severity = next((v['cvssData']['baseSeverity'] for key in
+                            ('cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2')
+                            for v in metrics.get(key, []) if 'baseSeverity' in v.get('cvssData', {})), None)
+                        description = next((d['value'] for d in cve.get('descriptions', []) if d.get('lang') == 'en'), '')
+                        old = db.execute('SELECT raw FROM cves WHERE id=?', (ident,)).fetchone()
+                        if old and old['raw'] == raw:
+                            continue
+                        db.execute('''INSERT INTO cves(id,description,severity,published,modified,raw,products)
+                            VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                            description=excluded.description,severity=excluded.severity,
+                            published=excluded.published,modified=excluded.modified,
+                            raw=excluded.raw,products=excluded.products''',
+                            (ident, description, severity, cve.get('published'), cve.get('lastModified'), raw, _matches(cve)))
+                        _decision(db, ident, raw, active)
+                total += len(items)
+                index += len(items)
+                if on_progress:
+                    on_progress(total, index, count)
+                if index >= count:
+                    break
+            if not start or window_end >= end:
                 break
-        if not start or window_end >= datetime.fromisoformat(end.replace('Z', '+00:00')):
-            break
-        start = window_end - timedelta(seconds=1)
-    with database() as db:
-        db.execute("INSERT INTO metadata VALUES ('cpe_cursor', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (end,))
-    return total
-
-
-def catalog_count(search=''):
-    if not search:
-        return rows('SELECT COUNT(*) AS total FROM cpes WHERE deprecated=0')[0]['total']
-    pattern = f'%{search}%'
-    return rows('''SELECT COUNT(*) AS total FROM cpes
-        WHERE deprecated=0 AND (name LIKE ? OR title LIKE ?)''', (pattern, pattern))[0]['total']
-
-
-def catalog(search='', limit=100, offset=0):
-    return rows('''SELECT name,title,vendor,product,version,tracked,in_use,deprecated FROM cpes
-        WHERE deprecated=0 AND (name LIKE ? OR title LIKE ?)
-        ORDER BY tracked DESC, vendor, product, version, name LIMIT ? OFFSET ?''',
-        (f'%{search}%', f'%{search}%', min(max(int(limit), 1), 500), max(int(offset), 0)))
-
-
-def track(name, enabled=True):
-    with database() as db:
-        result = db.execute('UPDATE cpes SET tracked=? WHERE name=? AND deprecated=0', (int(enabled), name))
-        if not result.rowcount:
-            raise ValueError('CPE not found or deprecated')
-
-
-def set_in_use(name, enabled):
-    with database() as db:
-        result = db.execute('UPDATE cpes SET in_use=? WHERE name=? AND tracked=1', (int(enabled), name))
-        if not result.rowcount:
-            raise ValueError('Tracked CPE not found')
-
-
-def poll(name):
-    cpe = rows('SELECT name FROM cpes WHERE name=? AND tracked=1 AND deprecated=0', (name,))
-    if not cpe:
-        raise ValueError('Tracked CPE not found')
-    index = 0
-    seen = set()
-    while True:
-        data = request('cves/2.0', {'cpeName': name, 'resultsPerPage': 2000, 'startIndex': index})
-        items = data['vulnerabilities']
+            start = window_end - timedelta(seconds=1)
         with database() as db:
-            for item in items:
-                cve = item['cve']
-                ident = cve['id']
-                seen.add(ident)
-                metrics = cve.get('metrics', {})
-                score = next((entry['cvssData'].get('baseSeverity') for key in ('cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2', 'cvssMetricV40') for entry in metrics.get(key, []) if 'baseSeverity' in entry.get('cvssData', {})), None)
-                description = next((d['value'] for d in cve.get('descriptions', []) if d['lang'] == 'en'), '')
-                db.execute('''INSERT INTO cves VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                    description=excluded.description,severity=excluded.severity,
-                    published=excluded.published,modified=excluded.modified''',
-                    (ident, description, score, cve.get('published'), cve.get('lastModified')))
-                db.execute('INSERT OR IGNORE INTO findings(cpe_name,cve_id) VALUES (?,?)', (name, ident))
-        index += len(items)
-        if not items or index >= data['totalResults']:
-            break
+            db.execute("INSERT INTO metadata VALUES ('advisory_cursor', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (end.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),))
+        return total
+
+
+def coverage():
+    return rows('SELECT vendor FROM coverage ORDER BY vendor COLLATE NOCASE')
+
+
+def add_coverage(vendor):
+    vendor = vendor.strip()
+    if not vendor:
+        raise ValueError('Vendor is required')
     with database() as db:
-        # A complete poll reconciles removed or corrected NVD matches without losing other CPE findings.
-        if seen:
-            db.execute(f"DELETE FROM findings WHERE cpe_name=? AND cve_id NOT IN ({','.join('?' for _ in seen)})", (name, *seen))
+        db.execute('INSERT OR IGNORE INTO coverage VALUES (?)', (vendor,))
+
+
+def remove_coverage(vendor):
+    with database() as db:
+        db.execute('DELETE FROM coverage WHERE vendor=?', (vendor,))
+
+
+def rules_list():
+    return rows('''SELECT r.*, (SELECT COUNT(*) FROM triage t WHERE t.rule_ids IS NOT NULL
+        AND EXISTS (SELECT 1 FROM json_each(t.rule_ids) WHERE value=r.id)) AS archived_count
+        FROM rules r ORDER BY r.id''')
+
+
+def reevaluate(db):
+    active = _enabled(db)
+    for row in db.execute('''SELECT c.id,c.raw FROM cves c LEFT JOIN triage t ON t.cve_id=c.id
+                             WHERE t.completed_at IS NULL''').fetchall():
+        _decision(db, row['id'], row['raw'], active)
+
+
+def add_rule(kind, vendor, product, branch='', minimum_version='', reason=''):
+    vendor, product, branch, minimum_version, reason = (s.strip() for s in (vendor, product, branch, minimum_version, reason))
+    if kind not in ('exclude', 'baseline') or not vendor or not product or (kind == 'baseline' and (not branch or not minimum_version)) or (kind == 'exclude' and (branch or minimum_version)):
+        raise ValueError('Specify a vendor/product and, for baselines, a branch and minimum version')
+    if kind == 'exclude' and not reason:
+        raise ValueError('Product exclusion requires a reason')
+    with database() as db:
+        ident = db.execute('INSERT INTO rules(kind,vendor,product,branch,minimum_version,reason) VALUES (?,?,?,?,?,?)',
+                           (kind, vendor, product, branch or None, minimum_version or None, reason)).lastrowid
+        reevaluate(db)
+        return ident
+
+
+def set_rule_enabled(ident, enabled):
+    with database() as db:
+        if not db.execute('UPDATE rules SET enabled=? WHERE id=?', (int(enabled), ident)).rowcount:
+            raise ValueError('Rule not found')
+        reevaluate(db)
+
+
+def delete_rule(ident):
+    with database() as db:
+        if not db.execute('DELETE FROM rules WHERE id=?', (ident,)).rowcount:
+            raise ValueError('Rule not found')
+        reevaluate(db)
+
+
+def set_notes(cve_id, notes):
+    with database() as db:
+        if not db.execute('SELECT 1 FROM cves WHERE id=?', (cve_id,)).fetchone():
+            raise ValueError('Advisory not found')
+        db.execute('INSERT INTO triage(cve_id,notes) VALUES (?,?) ON CONFLICT(cve_id) DO UPDATE SET notes=excluded.notes', (cve_id, notes))
+
+
+def set_complete(cve_id, complete):
+    with database() as db:
+        cve = db.execute('SELECT modified,raw FROM cves WHERE id=?', (cve_id,)).fetchone()
+        if not cve:
+            raise ValueError('Advisory not found')
+        if complete:
+            db.execute('''INSERT INTO triage(cve_id,completed_at,reviewed_modified,rule_ids,reason)
+                VALUES (?,?,?,NULL,NULL) ON CONFLICT(cve_id) DO UPDATE SET
+                completed_at=excluded.completed_at,reviewed_modified=excluded.reviewed_modified,
+                rule_ids=NULL,reason=NULL''', (cve_id, now(), cve['modified']))
         else:
-            db.execute('DELETE FROM findings WHERE cpe_name=?', (name,))
-        db.execute('UPDATE cpes SET polled_at=? WHERE name=?', (now(), name))
-    return len(seen)
+            db.execute('UPDATE triage SET completed_at=NULL,reviewed_modified=NULL WHERE cve_id=?', (cve_id,))
+            _decision(db, cve_id, cve['raw'], _enabled(db))
 
 
-def poll_due(hours=24):
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-    for cpe in rows('SELECT name FROM cpes WHERE tracked=1 AND deprecated=0 AND (polled_at IS NULL OR polled_at < ?) ORDER BY polled_at LIMIT 100', (cutoff,)):
-        poll(cpe['name'])
+def _where(search='', vendor='', product='', severity='', state='inbox'):
+    clause = ['1=1']
+    params = []
+    if search:
+        clause.append('(c.id LIKE ? OR c.description LIKE ?)')
+        params.extend((f'%{search}%', f'%{search}%'))
+    if vendor:
+        clause.append('c.products LIKE ?')
+        params.append(f'%{vendor}%')
+    if product:
+        clause.append('c.products LIKE ?')
+        params.append(f'%{product}%')
+    if severity:
+        clause.append('c.severity=?')
+        params.append(severity)
+    states = {'inbox': 't.completed_at IS NULL AND t.rule_ids IS NULL',
+              'completed': 't.completed_at IS NOT NULL',
+              'auto_archived': 't.completed_at IS NULL AND t.rule_ids IS NOT NULL',
+              'all': '1=1'}
+    if state not in states:
+        raise ValueError('Unknown state')
+    clause.append(states[state])
+    return ' AND '.join(clause), params
 
 
-def findings():
-    return rows('''SELECT f.cpe_name,f.cve_id,f.status,c.description,c.severity,c.published,
-        p.vendor,p.product,p.version FROM findings f JOIN cves c ON c.id=f.cve_id
-        JOIN cpes p ON p.name=f.cpe_name WHERE p.tracked=1 AND p.in_use=1
-        ORDER BY c.published DESC LIMIT 500''')
+def advisory_count(search='', vendor='', product='', severity='', state='inbox'):
+    where, params = _where(search, vendor, product, severity, state)
+    return rows(f'SELECT COUNT(*) AS total FROM cves c LEFT JOIN triage t ON t.cve_id=c.id WHERE {where}', params)[0]['total']
 
 
-def set_status(cpe_name, cve_id, status):
-    with database() as db:
-        if status is not None and not db.execute('SELECT 1 FROM statuses WHERE name=?', (status,)).fetchone():
-            raise ValueError('Unknown status')
-        result = db.execute('UPDATE findings SET status=? WHERE cpe_name=? AND cve_id=?', (status, cpe_name, cve_id))
-        if not result.rowcount:
-            raise ValueError('Finding not found')
+def advisories(search='', vendor='', product='', severity='', state='inbox', limit=50, offset=0):
+    where, params = _where(search, vendor, product, severity, state)
+    return rows(f'''SELECT c.id,c.description,c.severity,c.published,c.modified,c.products,
+        CASE WHEN t.completed_at IS NOT NULL THEN 'completed'
+             WHEN t.rule_ids IS NOT NULL THEN 'auto_archived' ELSE 'inbox' END AS state,
+        COALESCE(t.notes,'') AS notes,t.completed_at,t.reviewed_modified,t.rule_ids,
+        t.reason,t.evaluated_at,
+        CASE WHEN t.completed_at IS NOT NULL AND c.modified != t.reviewed_modified THEN 1 ELSE 0 END AS changed_since_review
+        FROM cves c LEFT JOIN triage t ON t.cve_id=c.id WHERE {where}
+        ORDER BY c.published DESC,c.id DESC LIMIT ? OFFSET ?''',
+        (*params, min(max(int(limit), 1), 5000), max(int(offset), 0)))
 
 
-def add_status(name):
-    name = name.strip()
-    if not name or len(name) > 60:
-        raise ValueError('Status must be 1–60 characters')
-    with database() as db:
-        db.execute('INSERT INTO statuses VALUES (?)', (name,))
+def export_csv(search='', vendor='', product='', severity='', state='all'):
+    stream = io.StringIO()
+    writer = csv.writer(stream)
+    writer.writerow(('CVE', 'Severity', 'Published', 'Modified', 'Vendor/Product', 'State',
+                     'Automatic rule IDs', 'Automatic reason', 'Notes', 'Completed'))
+    offset = 0
+    while True:
+        batch = advisories(search, vendor, product, severity, state, 5000, offset)
+        for item in batch:
+            fields = (item['id'], item['severity'], item['published'], item['modified'],
+                      item['products'], item['state'], item['rule_ids'], item['reason'],
+                      item['notes'], item['completed_at'])
+            writer.writerow([_csv_safe(field) for field in fields])
+        offset += len(batch)
+        if len(batch) < 5000:
+            break
+    return stream.getvalue()
+
+
+def _csv_safe(value):
+    value = str(value or '')
+    return "'" + value if value.lstrip().startswith(('=', '+', '-', '@')) or value.startswith(('\t', '\r', '\n')) else value
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Local NVD CPE and CVE tracker')
-    parser.add_argument('--db', help='SQLite path (default: FLEETCVES_DB or ./fleetcves.sqlite3)')
+    parser = argparse.ArgumentParser(description='Local NVD advisory inbox')
+    parser.add_argument('--db', help='SQLite path')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('serve')
     sub.add_parser('sync')
-    sub.add_parser('poll')
-    ls = sub.add_parser('cpes'); ls.add_argument('search', nargs='?', default='')
-    tr = sub.add_parser('track'); tr.add_argument('name'); tr.add_argument('--off', action='store_true')
-    use = sub.add_parser('in-use'); use.add_argument('name'); use.add_argument('enabled', choices=['yes', 'no'])
-    sub.add_parser('findings')
-    st = sub.add_parser('status'); st.add_argument('cpe'); st.add_argument('cve'); st.add_argument('name')
-    custom = sub.add_parser('add-status'); custom.add_argument('name')
+    listing = sub.add_parser('inbox')
+    listing.add_argument('--state', choices=['inbox', 'completed', 'auto_archived', 'all'], default='inbox')
+    listing.add_argument('--search', default='')
+    sub.add_parser('coverage')
+    add = sub.add_parser('add-coverage'); add.add_argument('vendor')
+    sub.add_parser('rules')
+    rule = sub.add_parser('add-rule'); rule.add_argument('kind', choices=['exclude', 'baseline'])
+    rule.add_argument('vendor'); rule.add_argument('product'); rule.add_argument('--branch', default='')
+    rule.add_argument('--minimum-version', default=''); rule.add_argument('--reason', default='')
+    disable = sub.add_parser('disable-rule'); disable.add_argument('id', type=int)
+    remove = sub.add_parser('delete-rule'); remove.add_argument('id', type=int)
+    export = sub.add_parser('export'); export.add_argument('--state', choices=['inbox', 'completed', 'auto_archived', 'all'], default='all')
+    export.add_argument('--search', default=''); export.add_argument('--vendor', default='')
+    export.add_argument('--product', default=''); export.add_argument('--severity', default='')
     args = parser.parse_args()
     global DB_PATH
     if args.db:
@@ -249,21 +360,23 @@ def main():
         from web import run
         run()
     elif args.command == 'sync':
-        print(sync_cpes())
-    elif args.command == 'poll':
-        poll_due(hours=0)
-    elif args.command == 'cpes':
-        print(json.dumps(catalog(args.search), indent=2))
-    elif args.command == 'track':
-        track(args.name, not args.off)
-    elif args.command == 'in-use':
-        set_in_use(args.name, args.enabled == 'yes')
-    elif args.command == 'findings':
-        print(json.dumps(findings(), indent=2))
-    elif args.command == 'status':
-        set_status(args.cpe, args.cve, None if args.name == 'clear' else args.name)
-    elif args.command == 'add-status':
-        add_status(args.name)
+        print(sync_advisories())
+    elif args.command == 'inbox':
+        print(json.dumps(advisories(search=args.search, state=args.state), indent=2))
+    elif args.command == 'coverage':
+        print(json.dumps(coverage(), indent=2))
+    elif args.command == 'add-coverage':
+        add_coverage(args.vendor)
+    elif args.command == 'rules':
+        print(json.dumps(rules_list(), indent=2))
+    elif args.command == 'add-rule':
+        print(add_rule(args.kind, args.vendor, args.product, args.branch, args.minimum_version, args.reason))
+    elif args.command == 'disable-rule':
+        set_rule_enabled(args.id, False)
+    elif args.command == 'delete-rule':
+        delete_rule(args.id)
+    elif args.command == 'export':
+        print(export_csv(args.search, args.vendor, args.product, args.severity, args.state), end='')
 
 
 if __name__ == '__main__':
