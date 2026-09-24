@@ -46,6 +46,8 @@ class TrackerTest(unittest.TestCase):
                 app.set_in_use(OTHER, False)
                 self.assertEqual([f['cpe_name'] for f in app.findings()], [NAME])
                 self.assertEqual(app.catalog('widget')[0]['tracked'], 1)
+                self.assertEqual(app.catalog_count('widget'), 2)
+                self.assertEqual([row['name'] for row in app.catalog('widget', 1, 1)], [OTHER])
                 with self.assertRaises(ValueError):
                     app.set_status(NAME, 'CVE-2026-1234', 'unknown')
 

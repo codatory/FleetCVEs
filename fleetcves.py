@@ -49,7 +49,8 @@ def initialize():
                 deprecated INTEGER NOT NULL DEFAULT 0, tracked INTEGER NOT NULL DEFAULT 0,
                 in_use INTEGER NOT NULL DEFAULT 1, polled_at TEXT
             );
-            CREATE INDEX IF NOT EXISTS cpes_search ON cpes(vendor, product, version);
+            DROP INDEX IF EXISTS cpes_search;
+            CREATE INDEX IF NOT EXISTS cpes_catalog ON cpes(deprecated, tracked DESC, vendor, product, version, name);
             CREATE TABLE IF NOT EXISTS statuses (name TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS cves (
                 id TEXT PRIMARY KEY, description TEXT NOT NULL, severity TEXT,
@@ -88,7 +89,7 @@ def request(endpoint, params):
             return json.load(response)
 
 
-def sync_cpes():
+def sync_cpes(on_progress=None):
     """Page the entire catalog initially; later query bounded modification windows.
 
     Cursor advances only after a full window, so a failed run safely replays it.
@@ -120,6 +121,8 @@ def sync_cpes():
                          parts[3], parts[4], parts[5], cpe['lastModified'], int(cpe.get('deprecated', False))))
             total += len(items)
             index += len(items)
+            if on_progress:
+                on_progress(total, index, data['totalResults'])
             if not items or index >= data['totalResults']:
                 break
         if not start or window_end >= datetime.fromisoformat(end.replace('Z', '+00:00')):
@@ -130,11 +133,19 @@ def sync_cpes():
     return total
 
 
-def catalog(search='', limit=100):
+def catalog_count(search=''):
+    if not search:
+        return rows('SELECT COUNT(*) AS total FROM cpes WHERE deprecated=0')[0]['total']
+    pattern = f'%{search}%'
+    return rows('''SELECT COUNT(*) AS total FROM cpes
+        WHERE deprecated=0 AND (name LIKE ? OR title LIKE ?)''', (pattern, pattern))[0]['total']
+
+
+def catalog(search='', limit=100, offset=0):
     return rows('''SELECT name,title,vendor,product,version,tracked,in_use,deprecated FROM cpes
-        WHERE (name LIKE ? OR title LIKE ?) AND deprecated=0
-        ORDER BY tracked DESC, vendor, product, version LIMIT ?''',
-        (f'%{search}%', f'%{search}%', min(max(int(limit), 1), 500)))
+        WHERE deprecated=0 AND (name LIKE ? OR title LIKE ?)
+        ORDER BY tracked DESC, vendor, product, version, name LIMIT ? OFFSET ?''',
+        (f'%{search}%', f'%{search}%', min(max(int(limit), 1), 500), max(int(offset), 0)))
 
 
 def track(name, enabled=True):

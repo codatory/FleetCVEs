@@ -37,8 +37,13 @@ def apply(fn, *args):
 
 
 @app.get('/api/cpes')
-def api_cpes(search: str = '', limit: int = 100):
-    return store.catalog(search, limit)
+def api_cpes(search: str = '', limit: int = 100, offset: int = 0):
+    return store.catalog(search, limit, offset)
+
+
+@app.get('/api/cpes/count')
+def api_cpe_count(search: str = ''):
+    return {'total': store.catalog_count(search)}
 
 
 @app.put('/api/cpes/{name:path}/tracked')
@@ -77,10 +82,15 @@ def api_status(data: StatusChange):
 
 async def sync_worker():
     global sync_state
+
+    def progress(imported, page_done, page_total):
+        global sync_state
+        sync_state = f'Syncing CPE catalog: {imported:,} processed (current batch {page_done:,}/{page_total:,})'
+
     while True:
         sync_state = 'Syncing CPE catalog from NVD…'
         try:
-            count = await asyncio.to_thread(store.sync_cpes)
+            count = await asyncio.to_thread(store.sync_cpes, progress)
             sync_state = f'Catalog updated ({count} CPE records); last sync {store.now()}'
         except Exception as exc:
             sync_state = f'NVD sync failed: {exc}'
@@ -117,16 +127,40 @@ def index():
         statuses_tab = ui.tab('Statuses')
     with ui.tab_panels(tabs, value=catalog_tab).classes('w-full'):
         with ui.tab_panel(catalog_tab):
+            page = {'index': 0}
+
+            def search_catalog():
+                page['index'] = 0
+                show_cpes.refresh()
+
+            def navigate(step):
+                page['index'] += step
+                show_cpes.refresh()
+
             with ui.row().classes('items-center'):
                 search = ui.input('Search CPE name or title').props('clearable').classes('w-96')
-                ui.button('Search', on_click=lambda: show_cpes.refresh())
+                search.on('keydown.enter', search_catalog)
+                ui.button('Search', on_click=search_catalog)
             ui.label('Select versions to track; uncheck In use to hide their findings.').classes('text-sm text-gray-600')
 
             @ui.refreshable
             def show_cpes():
-                entries = store.catalog(search.value or '', 100)
+                query = search.value or ''
+                total = store.catalog_count(query)
+                page['index'] = min(page['index'], max(0, (total - 1) // 50))
+                offset = page['index'] * 50
+                entries = store.catalog(query, 50, offset)
+                with ui.row().classes('items-center gap-3'):
+                    ui.label(f'Showing {offset + 1}–{offset + len(entries)} of {total:,}' if total else '0 matching CPEs')
+                    previous = ui.button('Previous', on_click=lambda: navigate(-1))
+                    if offset == 0:
+                        previous.props('disable')
+                    ui.label(f'Page {page["index"] + 1} of {max(1, (total + 49) // 50)}')
+                    following = ui.button('Next', on_click=lambda: navigate(1))
+                    if offset + 50 >= total:
+                        following.props('disable')
                 if not entries:
-                    ui.label('No CPEs yet. The initial NVD sync runs in the background.').classes('text-gray-600')
+                    ui.label('No CPEs yet. The initial NVD sync runs in the background.' if not query else 'No CPEs match this search.').classes('text-gray-600')
                 for item in entries:
                     with ui.row().classes('w-full items-center gap-4 border-b py-2'):
                         with ui.column().classes('flex-1 gap-0'):
