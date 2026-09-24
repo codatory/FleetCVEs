@@ -4,7 +4,6 @@ import csv
 import io
 import json
 import os
-import re
 import sqlite3
 import threading
 import time
@@ -14,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from rules import evaluate
+from rules import _cpe_parts, evaluate
 
 DB_PATH = Path(os.environ.get('FLEETCVES_DB', 'fleetcves.sqlite3'))
 NVD_BASE = os.environ.get('NVD_API_BASE', 'https://services.nvd.nist.gov/rest/json').rstrip('/')
@@ -59,6 +58,16 @@ def initialize():
             id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('exclude','baseline')),
             vendor TEXT NOT NULL, product TEXT NOT NULL, branch TEXT,
             minimum_version TEXT, reason TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)''')
+        db.execute('''CREATE TABLE IF NOT EXISTS advisory_products (
+            cve_id TEXT NOT NULL REFERENCES cves(id), vendor TEXT NOT NULL COLLATE NOCASE,
+            product TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY(cve_id,vendor,product))''')
+        db.execute('CREATE INDEX IF NOT EXISTS advisory_products_vendor ON advisory_products(vendor,product,cve_id)')
+        db.execute('CREATE INDEX IF NOT EXISTS cves_published ON cves(published DESC,id DESC)')
+        if not db.execute("SELECT 1 FROM metadata WHERE key='advisory_products_v1'").fetchone():
+            for record in db.execute('SELECT id,raw FROM cves WHERE raw IS NOT NULL'):
+                db.executemany('INSERT OR IGNORE INTO advisory_products VALUES (?,?,?)',
+                               ((record['id'], v, p) for v, p in _matches(json.loads(record['raw']))))
+            db.execute("INSERT INTO metadata VALUES ('advisory_products_v1','1')")
         db.execute('''CREATE TABLE IF NOT EXISTS triage (
             cve_id TEXT PRIMARY KEY REFERENCES cves(id), notes TEXT NOT NULL DEFAULT '',
             completed_at TEXT, reviewed_modified TEXT, rule_ids TEXT,
@@ -93,20 +102,20 @@ def request(endpoint, params):
 
 
 def _matches(cve):
-    """Index only the displayed products; raw configurations remain authoritative."""
+    """Index vulnerable CPE vendor/product pairs; retain raw configurations for decisions."""
     found = set()
     def visit(node):
         for match in node.get('cpeMatch', []):
             if match.get('vulnerable') is True:
-                parts = re.split(r'(?<!\\):', match.get('criteria', ''))
-                if len(parts) == 13 and parts[:2] == ['cpe', '2.3']:
+                parts = _cpe_parts(match.get('criteria'))
+                if parts and parts[3] not in ('*', '-') and parts[4] not in ('*', '-'):
                     found.add((parts[3], parts[4]))
         for child in node.get('children', []):
             visit(child)
     for configuration in cve.get('configurations', []):
         for node in configuration.get('nodes', []):
             visit(node)
-    return ', '.join(f'{vendor}/{product}' for vendor, product in sorted(found))
+    return sorted(found)
 
 
 def _enabled(db):
@@ -163,12 +172,16 @@ def sync_advisories(on_progress=None):
                         old = db.execute('SELECT raw FROM cves WHERE id=?', (ident,)).fetchone()
                         if old and old['raw'] == raw:
                             continue
+                        matches = _matches(cve)
                         db.execute('''INSERT INTO cves(id,description,severity,published,modified,raw,products)
                             VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                             description=excluded.description,severity=excluded.severity,
                             published=excluded.published,modified=excluded.modified,
                             raw=excluded.raw,products=excluded.products''',
-                            (ident, description, severity, cve.get('published'), cve.get('lastModified'), raw, _matches(cve)))
+                            (ident, description, severity, cve.get('published'), cve.get('lastModified'), raw,
+                             ', '.join(f'{v}/{p}' for v, p in matches)))
+                        db.execute('DELETE FROM advisory_products WHERE cve_id=?', (ident,))
+                        db.executemany('INSERT OR IGNORE INTO advisory_products VALUES (?,?,?)', ((ident, v, p) for v, p in matches))
                         _decision(db, ident, raw, active)
                 total += len(items)
                 index += len(items)
@@ -264,18 +277,21 @@ def set_complete(cve_id, complete):
             _decision(db, cve_id, cve['raw'], _enabled(db))
 
 
-def _where(search='', vendor='', product='', severity='', state='inbox'):
+def _where(search='', vendor='', product='', severity='', state='inbox', scope='all'):
     clause = ['1=1']
     params = []
     if search:
         clause.append('(c.id LIKE ? OR c.description LIKE ?)')
         params.extend((f'%{search}%', f'%{search}%'))
-    if vendor:
-        clause.append('c.products LIKE ?')
-        params.append(f'%{vendor}%')
-    if product:
-        clause.append('c.products LIKE ?')
-        params.append(f'%{product}%')
+    if vendor or product:
+        terms = ['ap.cve_id=c.id']
+        if vendor:
+            terms.append('ap.vendor=?')
+            params.append(vendor)
+        if product:
+            terms.append('instr(lower(ap.product),lower(?))>0')
+            params.append(product)
+        clause.append('EXISTS (SELECT 1 FROM advisory_products ap WHERE ' + ' AND '.join(terms) + ')')
     if severity:
         clause.append('c.severity=?')
         params.append(severity)
@@ -286,16 +302,23 @@ def _where(search='', vendor='', product='', severity='', state='inbox'):
     if state not in states:
         raise ValueError('Unknown state')
     clause.append(states[state])
+    scopes = {'all': None,
+              'covered': 'EXISTS (SELECT 1 FROM advisory_products ap JOIN coverage v ON v.vendor=ap.vendor WHERE ap.cve_id=c.id)',
+              'unmapped': 'NOT EXISTS (SELECT 1 FROM advisory_products ap WHERE ap.cve_id=c.id)'}
+    if scope not in scopes:
+        raise ValueError('Unknown scope')
+    if scopes[scope]:
+        clause.append(scopes[scope])
     return ' AND '.join(clause), params
 
 
-def advisory_count(search='', vendor='', product='', severity='', state='inbox'):
-    where, params = _where(search, vendor, product, severity, state)
+def advisory_count(search='', vendor='', product='', severity='', state='inbox', scope='all'):
+    where, params = _where(search, vendor, product, severity, state, scope)
     return rows(f'SELECT COUNT(*) AS total FROM cves c LEFT JOIN triage t ON t.cve_id=c.id WHERE {where}', params)[0]['total']
 
 
-def advisories(search='', vendor='', product='', severity='', state='inbox', limit=50, offset=0):
-    where, params = _where(search, vendor, product, severity, state)
+def advisories(search='', vendor='', product='', severity='', state='inbox', limit=50, offset=0, scope='all'):
+    where, params = _where(search, vendor, product, severity, state, scope)
     return rows(f'''SELECT c.id,c.description,c.severity,c.published,c.modified,c.products,
         CASE WHEN t.completed_at IS NOT NULL THEN 'completed'
              WHEN t.rule_ids IS NOT NULL THEN 'auto_archived' ELSE 'inbox' END AS state,
@@ -306,15 +329,21 @@ def advisories(search='', vendor='', product='', severity='', state='inbox', lim
         ORDER BY c.published DESC,c.id DESC LIMIT ? OFFSET ?''',
         (*params, min(max(int(limit), 1), 5000), max(int(offset), 0)))
 
+def advisory_detail(cve_id):
+    data = rows('SELECT raw FROM cves WHERE id=?', (cve_id,))
+    if not data:
+        raise ValueError('Advisory not found')
+    return json.loads(data[0]['raw']) if data[0]['raw'] else {}
 
-def export_csv(search='', vendor='', product='', severity='', state='all'):
+
+def export_csv(search='', vendor='', product='', severity='', state='all', scope='all'):
     stream = io.StringIO()
     writer = csv.writer(stream)
     writer.writerow(('CVE', 'Severity', 'Published', 'Modified', 'Vendor/Product', 'State',
                      'Automatic rule IDs', 'Automatic reason', 'Notes', 'Completed'))
     offset = 0
     while True:
-        batch = advisories(search, vendor, product, severity, state, 5000, offset)
+        batch = advisories(search, vendor, product, severity, state, 5000, offset, scope)
         for item in batch:
             fields = (item['id'], item['severity'], item['published'], item['modified'],
                       item['products'], item['state'], item['rule_ids'], item['reason'],

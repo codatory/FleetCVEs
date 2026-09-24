@@ -120,6 +120,39 @@ class AdvisoryTest(unittest.TestCase):
         self.assertEqual(result[0]['Notes'], "'  @SUM(A1)")
         self.assertEqual(result[0]['State'], 'inbox')
 
+    def test_coverage_and_vendor_product_filters_use_cpe_fields(self):
+        other = advisory('CVE-2026-0002', [{'vulnerable': True, 'criteria': 'cpe:2.3:a:other:acme_router:*:*:*:*:*:*:*:*'}])
+        self.sync(advisory(), other)
+        app.add_coverage('acme')
+        self.assertEqual([r['id'] for r in app.advisories(vendor='acme')], ['CVE-2026-1234'])
+        self.assertEqual(app.advisory_count(vendor='acme', product='acme_router'), 0)
+        self.assertEqual(app.advisory_count(scope='covered'), 1)
+        self.assertEqual(app.advisory_count(scope='all'), 2)
+        app.remove_coverage('acme')
+        self.assertEqual(app.advisory_count(scope='covered'), 0)
+
+    def test_source_correction_reindexes_pairs_and_preserves_unmapped(self):
+        self.sync(advisory())
+        self.sync(advisory(matches=[{'vulnerable': True, 'criteria': 'cpe:2.3:a:other:router:*:*:*:*:*:*:*:*'}],
+                           modified='2026-02-01T00:00:00.000Z'))
+        self.assertEqual(app.advisory_count(vendor='acme'), 0)
+        self.assertEqual(app.advisory_count(vendor='other', product='router'), 1)
+        self.sync(advisory(matches=[], modified='2026-03-01T00:00:00.000Z'))
+        self.assertEqual(app.advisory_count(scope='unmapped'), 1)
+        self.assertEqual(app.advisory_count(vendor='other'), 0)
+
+
+    def test_existing_raw_advisories_are_backfilled_once(self):
+        cve = advisory()
+        with app.database() as db:
+            db.execute("DELETE FROM metadata WHERE key='advisory_products_v1'")
+            db.execute('INSERT INTO cves(id,description,raw) VALUES (?,?,?)', (cve['id'], 'legacy', json.dumps(cve)))
+        app.initialize()
+        app.initialize()
+        self.assertEqual(app.advisory_count(vendor='acme', product='router', state='all'), 1)
+        self.assertEqual(app.advisory_detail(cve['id'])['configurations'], cve['configurations'])
+
+
     def test_legacy_database_preserves_status_and_original_tables(self):
         with app.database() as db:
             db.execute('CREATE TABLE cpes (name TEXT PRIMARY KEY)')

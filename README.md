@@ -17,7 +17,7 @@ Open <http://127.0.0.1:8080>. The first sync imports the NVD CVE collection and 
 
 ## Coverage and decisions
 
-Add vendors in **Coverage** to record your interests and use vendor filtering in the Inbox. NVD's CVE API has no reliable affected-manufacturer parameter: `sourceIdentifier` identifies the CVE source, not the affected vendor; `keywordSearch` searches text, while CPE-based `virtualMatchString` depends on incomplete/correctable mappings. FleetCVEs therefore imports CVEs **without a vendor restriction** and retains every advisory, including those with no usable configuration. Coverage is a display filter, **not an ingest exclusion**. Filtering by vendor/product uses the indexed vulnerable CPE identifiers and can miss advisories whose NVD configurations are absent, incomplete, or use a different name. Clear filters to review those. Expect false positives; absence from a filtered view does not prove safety.
+Add vendors in **Coverage** to focus the default **Monitored vendors** view in the Inbox and Archive. Adding/removing a vendor instantly includes/excludes its advisories from that view; this is bulk culling of the work queue, **not deletion or automatic archiving**. Switch **View** to **All advisories** to inspect every retained CVE, or **No product mapping** to audit unmapped CVEs. With no vendors configured the default view shows setup guidance, not the entire NVD feed. NVD's CVE API has no reliable affected-manufacturer parameter: sourceIdentifier identifies the CVE source, not the affected vendor; keywordSearch searches text, while CPE-based virtualMatchString depends on incomplete/correctable mappings. FleetCVEs imports without a vendor restriction and retains every advisory. Vendor filtering matches the CPE vendor field exactly (case-insensitive), and product search applies only to the product field of the **same** vulnerable CPE. Missing, incomplete, or differently named NVD mappings can still hide relevant entries from the monitored view; review **No product mapping** and **All advisories** periodically. Open **NVD details** on an advisory for CVSS scores/vectors, CWEs, affected CPE criteria/version bounds, source/status, and references.
 
 Two rules are supported:
 
@@ -58,7 +58,7 @@ fleetcves --db /path/to/fleet.sqlite3 sync
 
 ## JSON API
 
-The localhost server exposes `GET /api/advisories` (search, vendor, product, severity, state, limit, offset), `GET /api/advisories/count`, `GET /api/export.csv` (same filters), coverage and rules CRUD routes, and advisory notes/completion updates. The UI and CLI share one SQLite file.
+The localhost server exposes GET /api/advisories (search, vendor, product, severity, state, limit, offset, scope), GET /api/advisories/count, GET /api/advisories/{cve_id} (full stored NVD record), GET /api/export.csv (same filters), coverage and rules CRUD routes, and advisory notes/completion updates. scope=covered|unmapped|all defaults to all for API compatibility; the UI defaults to covered. The UI and CLI share one SQLite file.
 
 For a local integration, for example:
 
@@ -73,7 +73,7 @@ In the UI, complete an Inbox item after review; reopen it from **Archive / Compl
 
 ## Existing databases
 
-Schema initialization is idempotent. Existing `cves` rows gain raw JSON and product-index columns; old CPE catalog, findings, and statuses tables are left intact. Nonempty legacy per-CPE statuses are copied into advisory notes, retaining their CPE names; they are **not** assumed to mean manual completion. The original tables remain available for inspection. Historical CVEs without raw configurations stay in the Inbox until NVD imports them. Old CPE tracking/polling commands are removed; a fresh advisory sync is needed for complete coverage.
+Schema initialization is idempotent. Existing cves rows gain raw JSON and display product columns; vulnerable CPE vendor/product pairs are indexed from stored raw NVD records once on upgrade and updated on source corrections. Old CPE catalog, findings, and statuses tables are left intact. Nonempty legacy per-CPE statuses are copied into advisory notes, retaining their CPE names; they are **not** assumed to mean manual completion. Historical CVEs without raw configurations appear under **No product mapping** until NVD imports them. Old CPE tracking/polling commands are removed; a fresh advisory sync is needed for complete coverage.
 
 ## Check
 
