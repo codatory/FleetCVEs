@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fleetcves as app
+import web
 
 
 def match(product='router', **versions):
@@ -243,6 +244,17 @@ class AdvisoryTest(unittest.TestCase):
         app.initialize()
         self.assertIn('patched', app.advisories()[0]['notes'])
         self.assertEqual(app.rows('SELECT COUNT(*) AS n FROM findings')[0]['n'], 1)
+
+
+class PresentationTest(unittest.TestCase):
+    def test_product_and_rule_summaries_keep_decision_context(self):
+        self.assertEqual(web.product_summary('cisco/ios_xe, hpe/server'), 'cisco · ios xe +1 more')
+        self.assertEqual(web.product_summary(''), 'No NVD product mapping')
+        self.assertEqual(web.rule_summary({'kind': 'exclude', 'vendor': 'cisco', 'product': 'unused_ap', 'reason': 'No access points'}),
+                         'Product not deployed · cisco / unused_ap · No access points')
+        self.assertEqual(web.rule_summary({'kind': 'baseline', 'vendor': 'cisco', 'product': 'ios_xe', 'branch': '17.6', 'minimum_version': '17.6.6'}),
+                         'Minimum deployed version · cisco / ios_xe · branch 17.6 · ≥ 17.6.6')
+        self.assertEqual(web.readable_date('2026-09-18T10:00:00.000Z'), 'Sep 18, 2026')
 
 
 if __name__ == '__main__':
