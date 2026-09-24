@@ -1,0 +1,16 @@
+[project]
+name = "fleetcves"
+version = "0.1.0"
+description = "Local NVD CPE and vulnerability tracker"
+requires-python = ">=3.10"
+dependencies = ["nicegui>=2,<4"]
+
+[project.scripts]
+fleetcves = "fleetcves:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["fleetcves", "web"]
