@@ -62,6 +62,24 @@ class EvaluateTest(unittest.TestCase):
         self.assertIsNone(evaluate(advisory(match(cpe(version='*'), versionEndIncluding='18.0')), [baseline]))
         self.assertIsNone(evaluate(advisory(match(cpe(version='*'), versionStartIncluding='17.5.0', versionEndIncluding='17.6.4')), [baseline]))
 
+    def test_older_cutoff_covers_cross_branch_and_upper_only_ranges(self):
+        older = rule(5, 'exclude', minimum_version='17.1.3', reason='Older releases retired')
+        cases = [
+            match(cpe(version='*'), versionStartIncluding='13.1.0', versionEndIncluding='17.1.2'),
+            match(cpe(version='*'), versionEndExcluding='17.1.3'),
+            match(cpe(version='11.6.0')),
+        ]
+        for affected in cases:
+            result = evaluate(advisory(affected), [older])
+            self.assertEqual(result[0], [5])
+            self.assertIn('versions below 17.1.3 not deployed', result[1])
+        for affected in (match(cpe(version='17.1.3')),
+                         match(cpe(version='*'), versionEndIncluding='17.1.3'),
+                         match(cpe(version='*'), versionEndExcluding='17.1.3-hotfix'),
+                         match(cpe(version='*'), versionStartIncluding='18.0', versionEndExcluding='17.1.3')):
+            self.assertIsNone(evaluate(advisory(affected), [older]))
+        self.assertIsNone(evaluate(advisory(cases[0], match(cpe('other'))), [older]))
+
     def test_disabled_negated_or_unsupported_configurations_stay_inbox(self):
         self.assertIsNone(evaluate(advisory(match(cpe())), [rule(1, enabled=False)]))
         for cve in (advisory(match(cpe()), negate=True),

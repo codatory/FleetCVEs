@@ -184,6 +184,8 @@ def product_summary(products):
 def rule_summary(rule):
     product = f"{rule['vendor']} / {rule['product']}"
     if rule['kind'] == 'exclude':
+        if rule.get('minimum_version'):
+            return f"Versions below {rule['minimum_version']} not deployed · {product} · {rule['reason']}"
         return f"Product not deployed · {product} · {rule['reason']}"
     return f"Minimum deployed version · {product} · branch {rule['branch']} · ≥ {rule['minimum_version']}"
 
@@ -274,23 +276,23 @@ def index():
 
         with ui.tab_panel(rules_tab):
             ui.label('Triage rules').classes('text-lg font-semibold')
-            ui.label('Rules auto-file only advisories proven irrelevant. Create one from an advisory to prefill its product.').classes('text-sm text-gray-600')
+            ui.label('Rules auto-file only advisories proven irrelevant. Baselines cover only their branch; choose “Older versions not deployed” to explicitly exclude every numeric version below a cutoff across branches. An advisory stays in Inbox if any affected version or product remains uncovered.').classes('text-sm text-gray-600')
 
             with ui.expansion('Add rule manually').classes('w-full'):
                 with ui.row().classes('items-end gap-2 flex-wrap'):
-                    kind = ui.select({'exclude': 'Product not deployed', 'baseline': 'Minimum deployed version'}, value='exclude', label='Rule type').classes('w-56')
+                    kind = ui.select({'exclude': 'Product not deployed', 'baseline': 'Minimum deployed version', 'older': 'Older versions not deployed'}, value='exclude', label='Rule type').classes('w-56')
                     rvendor = ui.input('NVD vendor').classes('w-40')
                     rproduct = ui.input('NVD product').classes('w-40')
                     branch = ui.input('Numeric branch (e.g. 17.6)').classes('w-48')
-                    minimum = ui.input('Minimum deployed version').classes('w-48')
+                    minimum = ui.input('Version cutoff').classes('w-48')
                     branch.set_visibility(False)
                     minimum.set_visibility(False)
-                    kind.on_value_change(lambda e: (branch.set_visibility(e.value == 'baseline'), minimum.set_visibility(e.value == 'baseline')))
+                    kind.on_value_change(lambda e: (branch.set_visibility(e.value == 'baseline'), minimum.set_visibility(e.value in ('baseline', 'older'))))
                     reason = ui.input('Reason (required if not deployed)').classes('w-56')
                     def add_rule():
                         change(lambda: store.add_rule(kind.value, rvendor.value or '', rproduct.value or '',
                                                       (branch.value or '') if kind.value == 'baseline' else '',
-                                                      (minimum.value or '') if kind.value == 'baseline' else '', reason.value or ''),
+                                                      (minimum.value or '') if kind.value in ('baseline', 'older') else '', reason.value or ''),
                                refresh_rule_views)
                     ui.button('Add rule', on_click=add_rule)
 
@@ -316,7 +318,7 @@ def index():
                         with ui.column().classes('flex-1 min-w-52 gap-1'):
                             ui.label(rule_summary(rule)).classes('font-medium')
                             count = rule['archived_count']
-                            ui.label(f"{count} {'advisory' if count == 1 else 'advisories'} currently auto-filed").classes('text-xs text-gray-600')
+                            ui.label(f"{count} {'advisory' if count == 1 else 'advisories'} currently auto-filed · {rule['product_count']:,} mention this product").classes('text-xs text-gray-600')
                         ui.checkbox('Enabled', value=bool(rule['enabled']), on_change=lambda e, rid=rule['id']: change(lambda: store.set_rule_enabled(rid, e.value), refresh_rule_views))
                         ui.button('Delete', on_click=lambda _, r=rule: confirm_delete(r)).props('flat dense color=negative')
             show_rules()
@@ -369,21 +371,23 @@ def index():
                     ui.label('Create reusable product rule').classes('text-lg font-semibold')
                     ui.label(f'From {cve_id} · Applies to all existing and future matching advisories.').classes('text-sm text-gray-600')
                     pair = ui.select({i: f"{p['vendor']} / {p['product']}" for i, p in enumerate(pairs)}, value=0, label='Product this rule covers').classes('w-full')
-                    rule_kind = ui.select({'exclude': 'Product not deployed', 'baseline': 'Minimum deployed version'}, value='exclude', label='Rule').classes('w-full')
+                    rule_kind = ui.select({'exclude': 'Product not deployed', 'baseline': 'Minimum deployed version', 'older': 'Older versions not deployed'}, value='exclude', label='Rule').classes('w-full')
                     rule_branch = ui.input('Numeric branch (e.g. 17.6)').classes('w-full')
-                    rule_minimum = ui.input('Minimum deployed version (e.g. 17.6.6)').classes('w-full')
+                    rule_minimum = ui.input('Version cutoff (e.g. 17.6.6)').classes('w-full')
                     rule_branch.set_visibility(False)
                     rule_minimum.set_visibility(False)
                     explanation = ui.label('No deployed systems in this branch are older than this version.').classes('text-xs text-gray-600')
                     explanation.set_visibility(False)
-                    rule_kind.on_value_change(lambda e: (rule_branch.set_visibility(e.value == 'baseline'), rule_minimum.set_visibility(e.value == 'baseline'), explanation.set_visibility(e.value == 'baseline')))
+                    older_explanation = ui.label('Excludes every numeric version below the cutoff across branches. Only use if none are deployed.').classes('text-xs text-gray-600')
+                    older_explanation.set_visibility(False)
+                    rule_kind.on_value_change(lambda e: (rule_branch.set_visibility(e.value == 'baseline'), rule_minimum.set_visibility(e.value in ('baseline', 'older')), explanation.set_visibility(e.value == 'baseline'), older_explanation.set_visibility(e.value == 'older')))
                     rule_reason = ui.input('Reason (required if not deployed)').props('placeholder="Product not deployed"').classes('w-full')
                     def save_rule():
                         selected = pairs[pair.value]
                         try:
                             ident = store.add_rule(rule_kind.value, selected['vendor'], selected['product'],
                                                    (rule_branch.value or '') if rule_kind.value == 'baseline' else '',
-                                                   (rule_minimum.value or '') if rule_kind.value == 'baseline' else '',
+                                                   (rule_minimum.value or '') if rule_kind.value in ('baseline', 'older') else '',
                                                    rule_reason.value or '')
                         except ValueError as exc:
                             ui.notify(str(exc), type='negative')

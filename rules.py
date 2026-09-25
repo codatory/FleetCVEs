@@ -66,6 +66,19 @@ def _baseline_covers(match, parts, rule):
     return comparison < 0 or (comparison == 0 and bool(end_exclusive))
 
 
+def _older_covers(match, parts, rule):
+    minimum = _version(rule.get('minimum_version'))
+    start, start_exclusive = match.get('versionStartIncluding'), match.get('versionStartExcluding')
+    end, end_exclusive = match.get('versionEndIncluding'), match.get('versionEndExcluding')
+    if minimum is None or (start and start_exclusive) or (end and end_exclusive):
+        return False
+    lower = _version(start or start_exclusive) if start or start_exclusive else None
+    upper = _version(end or end_exclusive or match.get('version') or parts[5])
+    if upper is None or ((start or start_exclusive) and lower is None) or (lower and _compare(lower, upper) > 0):
+        return False
+    comparison = _compare(upper, minimum)
+    return comparison < 0 or (comparison == 0 and bool(end_exclusive))
+
 def _matches_product(parts, rule):
     vendor, product = parts[3:5]
     return (vendor not in ('*', '-') and product not in ('*', '-')
@@ -133,6 +146,8 @@ def evaluate(cve: dict, rules: list[dict]) -> tuple[list[int], str] | None:
                 continue
             if rule['kind'] == 'baseline' and not _baseline_covers(match, parts, rule):
                 continue
+            if rule['kind'] == 'exclude' and rule.get('minimum_version') and not _older_covers(match, parts, rule):
+                continue
             try:
                 rule_id = int(rule['id'])
             except (KeyError, TypeError, ValueError):
@@ -148,6 +163,9 @@ def evaluate(cve: dict, rules: list[dict]) -> tuple[list[int], str] | None:
         if rule['kind'] == 'baseline':
             text = (f"rule #{rule_id} baseline for {product}, branch {rule.get('branch')} "
                     f"(minimum {rule.get('minimum_version')}), affected {_affected_range(match, parts)}")
+        elif rule.get('minimum_version'):
+            text = (f"rule #{rule_id} versions below {rule['minimum_version']} not deployed for {product}, "
+                    f"affected {_affected_range(match, parts)}")
         else:
             text = f"rule #{rule_id} exclude for {product}, affected {_affected_range(match, parts)}"
         reason = str(rule.get('reason') or '').strip()

@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from rules import _cpe_parts, evaluate
+from rules import _cpe_parts, _version, evaluate
 
 DB_PATH = Path(os.environ.get('FLEETCVES_DB', 'fleetcves.sqlite3'))
 NVD_BASE = os.environ.get('NVD_API_BASE', 'https://services.nvd.nist.gov/rest/json').rstrip('/')
@@ -244,42 +244,53 @@ def remove_coverage(vendor):
 
 def rules_list():
     return rows('''SELECT r.*, (SELECT COUNT(*) FROM triage t WHERE t.rule_ids IS NOT NULL
-        AND EXISTS (SELECT 1 FROM json_each(t.rule_ids) WHERE value=r.id)) AS archived_count
+        AND EXISTS (SELECT 1 FROM json_each(t.rule_ids) WHERE value=r.id)) AS archived_count,
+        (SELECT COUNT(*) FROM advisory_products ap WHERE ap.vendor=r.vendor AND ap.product=r.product) AS product_count
         FROM rules r ORDER BY r.id''')
 
 
-def reevaluate(db):
+def reevaluate(db, vendor, product):
     active = _enabled(db)
-    for row in db.execute('''SELECT c.id,c.raw FROM cves c LEFT JOIN triage t ON t.cve_id=c.id
-                             WHERE t.completed_at IS NULL AND t.disposition IS NULL''').fetchall():
+    for row in db.execute('''SELECT c.id,c.raw FROM advisory_products ap
+                             JOIN cves c ON c.id=ap.cve_id
+                             LEFT JOIN triage t ON t.cve_id=c.id
+                             WHERE ap.vendor=? AND ap.product=?
+                             AND t.completed_at IS NULL AND t.disposition IS NULL''', (vendor, product)):
         _decision(db, row['id'], row['raw'], active)
 
 
 def add_rule(kind, vendor, product, branch='', minimum_version='', reason=''):
     vendor, product, branch, minimum_version, reason = (s.strip() for s in (vendor, product, branch, minimum_version, reason))
-    if kind not in ('exclude', 'baseline') or not vendor or not product or (kind == 'baseline' and (not branch or not minimum_version)) or (kind == 'exclude' and (branch or minimum_version)):
-        raise ValueError('Specify a vendor/product and, for baselines, a branch and minimum version')
-    if kind == 'exclude' and not reason:
-        raise ValueError('Product exclusion requires a reason')
+    if (kind not in ('exclude', 'baseline', 'older') or not vendor or not product
+            or (kind == 'baseline' and (not branch or not minimum_version))
+            or (kind == 'exclude' and (branch or minimum_version))
+            or (kind == 'older' and (branch or _version(minimum_version) is None))):
+        raise ValueError('Specify a vendor/product and, for baselines or older versions, the required version fields')
+    if kind in ('exclude', 'older') and not reason:
+        raise ValueError('Exclusion requires a reason')
     with database() as db:
         ident = db.execute('INSERT INTO rules(kind,vendor,product,branch,minimum_version,reason) VALUES (?,?,?,?,?,?)',
-                           (kind, vendor, product, branch or None, minimum_version or None, reason)).lastrowid
-        reevaluate(db)
+                           ('exclude' if kind == 'older' else kind, vendor, product, branch or None, minimum_version or None, reason)).lastrowid
+        reevaluate(db, vendor, product)
         return ident
 
 
 def set_rule_enabled(ident, enabled):
     with database() as db:
-        if not db.execute('UPDATE rules SET enabled=? WHERE id=?', (int(enabled), ident)).rowcount:
+        rule = db.execute('SELECT vendor,product FROM rules WHERE id=?', (ident,)).fetchone()
+        if not rule:
             raise ValueError('Rule not found')
-        reevaluate(db)
+        db.execute('UPDATE rules SET enabled=? WHERE id=?', (int(enabled), ident))
+        reevaluate(db, rule['vendor'], rule['product'])
 
 
 def delete_rule(ident):
     with database() as db:
-        if not db.execute('DELETE FROM rules WHERE id=?', (ident,)).rowcount:
+        rule = db.execute('SELECT vendor,product FROM rules WHERE id=?', (ident,)).fetchone()
+        if not rule:
             raise ValueError('Rule not found')
-        reevaluate(db)
+        db.execute('DELETE FROM rules WHERE id=?', (ident,))
+        reevaluate(db, rule['vendor'], rule['product'])
 
 
 def set_notes(cve_id, notes):
@@ -408,7 +419,7 @@ def main():
     sub.add_parser('coverage')
     add = sub.add_parser('add-coverage'); add.add_argument('vendor')
     sub.add_parser('rules')
-    rule = sub.add_parser('add-rule'); rule.add_argument('kind', choices=['exclude', 'baseline'])
+    rule = sub.add_parser('add-rule'); rule.add_argument('kind', choices=['exclude', 'baseline', 'older'])
     rule.add_argument('vendor'); rule.add_argument('product'); rule.add_argument('--branch', default='')
     rule.add_argument('--minimum-version', default=''); rule.add_argument('--reason', default='')
     disable = sub.add_parser('disable-rule'); disable.add_argument('id', type=int)
@@ -425,8 +436,9 @@ def main():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s',
                             handlers=[logging.StreamHandler(), logging.FileHandler(str(DB_PATH) + '.log')])
     if args.command == 'serve':
-        from web import run
-        run()
+        import web
+        web.store.DB_PATH = DB_PATH
+        web.run()
     elif args.command == 'sync':
         try:
             print(sync_advisories())
